@@ -1,0 +1,11 @@
+trial,init_index,cue,stage1_mode,cue_read_correct,stage1_success,expected_next,memory_choice,ablated_choice,continuation_success,memory_task_success,ablated_task_success,replay_qpos_error,post_cue_image_sha256
+green_pair1,0,GREEN,replay,true,true,CONTINUE,CONTINUE,CONTINUE,true,true,true,0.0,5552404e917bdc83ea92d6493b30ed2c45a3c52ed123c88faa7246d85cb5f375
+red_pair2,0,RED,replay,true,true,STOP,STOP,CONTINUE,true,true,false,0.0,5552404e917bdc83ea92d6493b30ed2c45a3c52ed123c88faa7246d85cb5f375
+green_init1_live,1,GREEN,online,true,true,CONTINUE,CONTINUE,CONTINUE,true,true,true,0.0,4530af2aaea582b9f5ee57be68e2e8b316e8fe1f24ca352bff8d56495daa2d0d
+red_init1_replay,1,RED,replay,true,true,STOP,STOP,CONTINUE,true,true,false,0.0,4530af2aaea582b9f5ee57be68e2e8b316e8fe1f24ca352bff8d56495daa2d0d
+green_init2_live,2,GREEN,online,true,true,CONTINUE,CONTINUE,CONTINUE,true,true,true,0.0,0c6c227b1fb248f13b7faddd72aaeb995483adac64ab41c67f44293de7320b9f
+red_init2_replay,2,RED,replay,true,true,STOP,STOP,CONTINUE,true,true,false,0.0,0c6c227b1fb248f13b7faddd72aaeb995483adac64ab41c67f44293de7320b9f
+green_init3_live,3,GREEN,online,true,true,CONTINUE,CONTINUE,CONTINUE,true,true,true,0.0,0665615afc18f86c9df64263eb496c6b98c473e3fbf0ba59143c9aad086f6e72
+red_init3_replay,3,RED,replay,true,true,STOP,STOP,CONTINUE,true,true,false,0.0,0665615afc18f86c9df64263eb496c6b98c473e3fbf0ba59143c9aad086f6e72
+green_init4_live,4,GREEN,online,true,true,CONTINUE,CONTINUE,CONTINUE,true,true,true,0.0,cda74ca137f3124e7b8bef9025907f62a05ab95ad2a929342ba2487b36981424
+red_init4_replay,4,RED,replay,true,true,STOP,STOP,CONTINUE,true,true,false,0.0,cda74ca137f3124e7b8bef9025907f62a05ab95ad2a929342ba2487b36981424

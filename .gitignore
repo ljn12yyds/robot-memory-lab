@@ -35,3 +35,7 @@ download_cache/
 *.tgz
 *.zip
 
+# Private experiment artifacts; publish only aggregate tables and analysis code
+experiments/transient_cue_20261019/raw/
+experiments/transient_cue_20261019/media/
+

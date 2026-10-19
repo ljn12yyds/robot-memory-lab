@@ -1,5 +1,7 @@
 # Robot Memory Lab
 
+[中文说明](README.zh-CN.md)
+
 Research code for SO-101 manipulation, policy improvement from human intervention, and task-level memory experiments. This repository contains our experiment scripts and patches against pinned upstream projects; it does not redistribute their full source trees, robot datasets, calibration files, or model weights.
 
 ## Contents
@@ -13,6 +15,7 @@ Research code for SO-101 manipulation, policy improvement from human interventio
 | `patches/robotwin-memory-data.patch` | Separate RoboTwin simulator/data-collection modifications for memory experiments. |
 | `task_memory_agent/` | Task-level planning, JSON memory, subtask annotations, simulator adapters, and unit tests. |
 | `libero_eval/` | Qwen upper-layer service and paired LIBERO/pi0.5 evaluation scripts. |
+| `experiments/transient_cue_20261019/` | Paired one-time visual cue memory pilot: protocol, aggregate trial table, and validation code. |
 | `UPSTREAMS.md` | Exact upstream commits and patch application notes. |
 
 ## Research stages
@@ -23,6 +26,10 @@ Research code for SO-101 manipulation, policy improvement from human interventio
 4. Explore task-level memory and subtask control in simulation. The RoboTwin patch and LIBERO evaluation scripts are experimental and separate from the SO-101 real-robot pipeline.
 
 The work is **research code**, not a validated general-purpose robot controller. Successful training runs do not establish reliable autonomous performance. Real-robot commands must be reviewed for device mapping, workspace limits, emergency-stop access, and calibration before use.
+
+## First controlled memory pilot
+
+In a five-initial-state LIBERO pilot with a one-time synthetic visual cue, the upper agent made the correct next-subtask choice in 10/10 red/green trials with persisted cue memory versus 5/10 when that memory field was removed. The same current image was used within each pair, and the known lower-policy continuation succeeded when requested. See [protocol, aggregate trial table, and limitations](experiments/transient_cue_20261019/README.md). Raw JSON, images, and videos are not public. This is evidence for the task-level memory interface in this controlled setting, not general long-horizon memory or real-robot success.
 
 ## Reproduction boundary
 
