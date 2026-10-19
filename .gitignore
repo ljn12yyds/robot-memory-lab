@@ -1,0 +1,37 @@
+# Generated Python and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.tmp/
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+
+# Robot-specific and potentially sensitive state
+calibration/
+secrets/
+*.key
+*.pem
+
+# Datasets, recordings, checkpoints, caches, and transfer archives
+data/
+models/
+outputs/
+logs/
+runs/
+videos/
+download_cache/
+.cache/
+*.hdf5
+*.h5
+*.parquet
+*.mp4
+*.pt
+*.pth
+*.safetensors
+*.ckpt
+*.tgz
+*.zip
+

@@ -1,0 +1,206 @@
+diff --git a/envs/_base_task.py b/envs/_base_task.py
+index 301da9f..549015b 100644
+--- a/envs/_base_task.py
++++ b/envs/_base_task.py
+@@ -211,10 +211,13 @@ class Base_Task(gym.Env):
+         # give renderer to sapien sim
+         self.engine.set_renderer(self.renderer)
+ 
+-        sapien.render.set_camera_shader_dir("rt")
+-        sapien.render.set_ray_tracing_samples_per_pixel(32)
+-        sapien.render.set_ray_tracing_path_depth(8)
+-        sapien.render.set_ray_tracing_denoiser("oidn")
++        if os.environ.get("ROBOTWIN_CAMERA_SHADER", "rt") == "default":
++            sapien.render.set_camera_shader_dir("default")
++        else:
++            sapien.render.set_camera_shader_dir("rt")
++            sapien.render.set_ray_tracing_samples_per_pixel(32)
++            sapien.render.set_ray_tracing_path_depth(8)
++            sapien.render.set_ray_tracing_denoiser("oidn")
+ 
+         # declare sapien scene
+         scene_config = sapien.SceneConfig()
+diff --git a/envs/camera/camera.py b/envs/camera/camera.py
+index 46d960d..10fad76 100644
+--- a/envs/camera/camera.py
++++ b/envs/camera/camera.py
+@@ -2,7 +2,6 @@ import sapien.core as sapien
+ import numpy as np
+ import pdb
+ from PIL import Image, ImageColor
+-import open3d as o3d
+ import json
+ import transforms3d as t3d
+ import cv2
+diff --git a/envs/stack_blocks_three.py b/envs/stack_blocks_three.py
+index 0ab0917..be96dc3 100644
+--- a/envs/stack_blocks_three.py
++++ b/envs/stack_blocks_three.py
+@@ -2,12 +2,22 @@ from ._base_task import Base_Task
+ from .utils import *
+ import sapien
+ import math
++from itertools import permutations
+ 
+ 
+ class stack_blocks_three(Base_Task):
+ 
+     def setup_demo(self, **kwags):
+         super()._init_task_env_(**kwags)
++        blocks = [
++            ("red", self.block1),
++            ("green", self.block2),
++            ("blue", self.block3),
++        ]
++        if kwags.get("stack_order_mode") == "all_permutations":
++            self.stack_order = list(permutations(blocks))[self.ep_num % 6]
++        else:
++            self.stack_order = tuple(blocks)
+ 
+     def load_actors(self):
+         block_half_size = 0.025
+@@ -65,23 +75,61 @@ class stack_blocks_three(Base_Task):
+         # Initialize tracking variables for last used gripper and actor
+         self.last_gripper = None
+         self.last_actor = None
+-
+-        # Pick and place the first block (red) and get which arm was used
+-        arm_tag1 = self.pick_and_place_block(self.block1)
+-        # Pick and place the second block (green) and get which arm was used
+-        arm_tag2 = self.pick_and_place_block(self.block2)
+-        # Pick and place the third block (blue) and get which arm was used
+-        arm_tag3 = self.pick_and_place_block(self.block3)
++        subtask_segments = []
++
++        def execute_subtask(block, instruction, success_condition, expected_effects):
++            start = self.FRAME_IDX
++            arm_tag = self.pick_and_place_block(block)
++            subtask_segments.append({
++                "subtask_id": len(subtask_segments),
++                "instruction": instruction,
++                "success_condition": success_condition,
++                "expected_effects": expected_effects,
++                "start": start,
++                "end": self.FRAME_IDX,
++            })
++            return arm_tag
++
++        color_names = [color for color, _ in self.stack_order]
++        arm_tags = []
++        for index, (color, block) in enumerate(self.stack_order):
++            if index == 0:
++                instruction = f"pick up the {color} block and place it at the center as the tower base"
++                success_condition = (
++                    f"the {color} block is stable at the center and the manipulating gripper has released it"
++                )
++                expected_effects = {f"{color}_block": "centered_base", "tower_height": "one"}
++            else:
++                below = color_names[index - 1]
++                instruction = f"pick up the {color} block and place it stably on top of the {below} block"
++                success_condition = (
++                    f"the {color} block is supported by and aligned over the {below} block and the gripper has released it"
++                )
++                expected_effects = {
++                    f"{color}_block": f"on_{below}",
++                    "tower_height": ("two" if index == 1 else "three"),
++                }
++                if index == 2:
++                    expected_effects["both_grippers"] = "open"
++            arm_tags.append(
++                execute_subtask(block, instruction, success_condition, expected_effects)
++            )
+ 
+         # Store information about the blocks and which arms were used
+         self.info["info"] = {
+             "{A}": "red block",
+             "{B}": "green block",
+             "{C}": "blue block",
+-            "{a}": str(arm_tag1),
+-            "{b}": str(arm_tag2),
+-            "{c}": str(arm_tag3),
++            "{a}": str(arm_tags[0]),
++            "{b}": str(arm_tags[1]),
++            "{c}": str(arm_tags[2]),
+         }
++        self.info["stack_order"] = color_names
++        self.info["task"] = (
++            f"build a centered three-block tower with {color_names[0]} on the bottom, "
++            f"{color_names[1]} in the middle, and {color_names[2]} on top"
++        )
++        self.info["subtask_segments"] = subtask_segments
+         return self.info
+ 
+     def pick_and_place_block(self, block: Actor):
+@@ -120,11 +168,9 @@ class stack_blocks_three(Base_Task):
+         return str(arm_tag)
+ 
+     def check_success(self):
+-        block1_pose = self.block1.get_pose().p
+-        block2_pose = self.block2.get_pose().p
+-        block3_pose = self.block3.get_pose().p
++        block_poses = [block.get_pose().p for _, block in self.stack_order]
+         eps = [0.025, 0.025, 0.012]
+ 
+-        return (np.all(abs(block2_pose - np.array(block1_pose[:2].tolist() + [block1_pose[2] + 0.05])) < eps)
+-                and np.all(abs(block3_pose - np.array(block2_pose[:2].tolist() + [block2_pose[2] + 0.05])) < eps)
++        return (np.all(abs(block_poses[1] - np.array(block_poses[0][:2].tolist() + [block_poses[0][2] + 0.05])) < eps)
++                and np.all(abs(block_poses[2] - np.array(block_poses[1][:2].tolist() + [block_poses[1][2] + 0.05])) < eps)
+                 and self.is_left_gripper_open() and self.is_right_gripper_open())
+diff --git a/envs/utils/save_file.py b/envs/utils/save_file.py
+index 53b3cda..dbdd7bd 100644
+--- a/envs/utils/save_file.py
++++ b/envs/utils/save_file.py
+@@ -5,7 +5,6 @@ import json
+ 
+ import os
+ import pickle
+-import open3d as o3d
+ 
+ 
+ def ensure_dir(file_path):
+@@ -33,6 +32,8 @@ def save_pkl(save_path, dic_file):
+ 
+ 
+ def save_pcd(save_path, pcd_arr, color=False):
++    import open3d as o3d
++
+     ensure_dir(save_path)
+     point_cloud = o3d.geometry.PointCloud()
+     point_arr = pcd_arr[:, :3]
+diff --git a/scripts/collect_data.py b/scripts/collect_data.py
+index 5c529f1..6c45b94 100644
+--- a/scripts/collect_data.py
++++ b/scripts/collect_data.py
+@@ -24,14 +24,25 @@ parent_directory = os.path.dirname(current_file_path)
+ 
+ def build_episode_instructions(args, episode_info, episode_idx):
+     fallback = args["task_name"].replace("_", " ")
+-    info = episode_info.get("info", {}) if isinstance(episode_info, dict) else {}
+-    generated = generate_episode_descriptions(
+-        args["task_name"], [info], int(args.get("language_num") or 100)
+-    )
+-    if generated:
+-        episode_descriptions = generated[0]
++    stack_order = episode_info.get("stack_order") if isinstance(episode_info, dict) else None
++    if stack_order and len(stack_order) == 3:
++        bottom, middle, top = stack_order
++        episode_descriptions = {
++            "seen": [
++                f"Build a centered three-block tower with {bottom} block on the bottom, "
++                f"{middle} block in the middle, and {top} block on top."
++            ],
++            "unseen": [
++                f"Place {bottom} block at the center, then stack {middle} block on "
++                f"{bottom} block and {top} block on {middle} block."
++            ],
++        }
+     else:
+-        episode_descriptions = {"seen": [], "unseen": []}
++        info = episode_info.get("info", {}) if isinstance(episode_info, dict) else {}
++        generated = generate_episode_descriptions(
++            args["task_name"], [info], int(args.get("language_num") or 100)
++        )
++        episode_descriptions = generated[0] if generated else {"seen": [], "unseen": []}
+ 
+     episode_descriptions["episode_index"] = episode_idx
+     for split in ("seen", "unseen"):

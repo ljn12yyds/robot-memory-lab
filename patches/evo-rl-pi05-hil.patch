@@ -1,0 +1,2553 @@
+diff --git a/src/lerobot/configs/train.py b/src/lerobot/configs/train.py
+index c70efea..5904635 100644
+--- a/src/lerobot/configs/train.py
++++ b/src/lerobot/configs/train.py
+@@ -60,6 +60,9 @@ class TrainPipelineConfig(HubMixin):
+     # Number of workers for the dataloader.
+     num_workers: int = 4
+     batch_size: int = 8
++    # Number of micro-batches accumulated before one optimizer update. ``steps``
++    # continues to count optimizer updates, not micro-batches.
++    gradient_accumulation_steps: int = 1
+     steps: int = 100_000
+     eval_freq: int = 20_000
+     log_freq: int = 200
+@@ -87,6 +90,8 @@ class TrainPipelineConfig(HubMixin):
+     checkpoint_path: Path | None = field(init=False, default=None)
+ 
+     def validate(self) -> None:
++        if self.gradient_accumulation_steps < 1:
++            raise ValueError("gradient_accumulation_steps must be at least 1")
+         # HACK: We parse again the cli args here to get the pretrained paths if there was some.
+         policy_path = parser.get_path_arg("policy")
+         if policy_path:
+diff --git a/src/lerobot/configs/value.py b/src/lerobot/configs/value.py
+index 8c47678..e99aad8 100644
+--- a/src/lerobot/configs/value.py
++++ b/src/lerobot/configs/value.py
+@@ -19,6 +19,7 @@ class ValueInferenceDatasetConfig:
+     episodes: list[int] | None = None
+     revision: str | None = None
+     download_videos: bool = True
++    video_backend: str | None = None
+     success_field: str = "episode_success"
+     default_success: str = "failure"
+ 
+@@ -65,6 +66,7 @@ class ValueInferenceACPConfig:
+     n_step: int = 50
+     positive_ratio: float = 0.3
+     force_intervention_positive: bool = True
++    gate_intervention_by_episode_success: bool = False
+ 
+     intervention_field: str = "complementary_info.is_intervention"
+     value_field: str = "complementary_info.value"
+@@ -80,6 +82,11 @@ class ValueInferenceACPConfig:
+             raise ValueError("'acp.positive_ratio' must be within [0, 1].")
+         if self.c_fail_coef < 0:
+             raise ValueError("'acp.c_fail_coef' must be non-negative.")
++        if self.gate_intervention_by_episode_success and not self.force_intervention_positive:
++            raise ValueError(
++                "'acp.gate_intervention_by_episode_success=true' requires "
++                "'acp.force_intervention_positive=true'."
++            )
+         if not self.value_field:
+             raise ValueError("'acp.value_field' must be non-empty.")
+         if self.enable and (not self.advantage_field or not self.indicator_field):
+diff --git a/src/lerobot/configs/value_train.py b/src/lerobot/configs/value_train.py
+index 1569331..dc2601a 100644
+--- a/src/lerobot/configs/value_train.py
++++ b/src/lerobot/configs/value_train.py
+@@ -59,6 +59,9 @@ class ValueTrainPipelineConfig(HubMixin):
+ 
+     num_workers: int = 4
+     batch_size: int = 64
++    # Number of micro-batches accumulated before one optimizer update. ``steps``
++    # continues to count optimizer updates, not micro-batches.
++    gradient_accumulation_steps: int = 1
+     steps: int = 8_000
+     log_freq: int = 200
+     tolerance_s: float = 1e-4
+@@ -84,6 +87,8 @@ class ValueTrainPipelineConfig(HubMixin):
+         return self.value
+ 
+     def validate(self) -> None:
++        if self.gradient_accumulation_steps < 1:
++            raise ValueError("gradient_accumulation_steps must be at least 1")
+         value_path = parser.get_path_arg("value")
+         if value_path:
+             cli_overrides = parser.get_cli_overrides("value")
+diff --git a/src/lerobot/datasets/dataset_tools.py b/src/lerobot/datasets/dataset_tools.py
+index 27e67ae..f2c5f74 100644
+--- a/src/lerobot/datasets/dataset_tools.py
++++ b/src/lerobot/datasets/dataset_tools.py
+@@ -1032,6 +1032,11 @@ def _copy_data_with_feature_changes(
+                     feature_slice = values[frame_idx:end_idx]
+                     if len(feature_slice.shape) > 1 and feature_slice.shape[1] == 1:
+                         df[feature_name] = feature_slice.flatten()
++                    elif len(feature_slice.shape) > 1:
++                        # Pandas 的一列只能接收一维序列。这里的二维数组表示
++                        # “每一帧对应一个向量字段”，因此要把每帧向量作为单独元素写入。
++                        # 直接赋值二维数组会在 Pandas 2.3+ 中触发 shape 错误。
++                        df[feature_name] = list(feature_slice)
+                     else:
+                         df[feature_name] = feature_slice
+             frame_idx = end_idx
+diff --git a/src/lerobot/policies/factory.py b/src/lerobot/policies/factory.py
+index 1f4270d..764a1ed 100644
+--- a/src/lerobot/policies/factory.py
++++ b/src/lerobot/policies/factory.py
+@@ -270,26 +270,48 @@ def make_pre_post_processors(
+             kwargs["preprocessor_overrides"] = preprocessor_overrides
+             kwargs["postprocessor_overrides"] = postprocessor_overrides
+ 
+-        return (
+-            PolicyProcessorPipeline.from_pretrained(
+-                pretrained_model_name_or_path=pretrained_path,
+-                config_filename=kwargs.get(
+-                    "preprocessor_config_filename", f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json"
++        try:
++            return (
++                PolicyProcessorPipeline.from_pretrained(
++                    pretrained_model_name_or_path=pretrained_path,
++                    config_filename=kwargs.get(
++                        "preprocessor_config_filename", f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json"
++                    ),
++                    overrides=kwargs.get("preprocessor_overrides", {}),
++                    to_transition=batch_to_transition,
++                    to_output=transition_to_batch,
+                 ),
+-                overrides=kwargs.get("preprocessor_overrides", {}),
+-                to_transition=batch_to_transition,
+-                to_output=transition_to_batch,
+-            ),
+-            PolicyProcessorPipeline.from_pretrained(
+-                pretrained_model_name_or_path=pretrained_path,
+-                config_filename=kwargs.get(
+-                    "postprocessor_config_filename", f"{POLICY_POSTPROCESSOR_DEFAULT_NAME}.json"
++                PolicyProcessorPipeline.from_pretrained(
++                    pretrained_model_name_or_path=pretrained_path,
++                    config_filename=kwargs.get(
++                        "postprocessor_config_filename", f"{POLICY_POSTPROCESSOR_DEFAULT_NAME}.json"
++                    ),
++                    overrides=kwargs.get("postprocessor_overrides", {}),
++                    to_transition=policy_action_to_transition,
++                    to_output=transition_to_policy_action,
+                 ),
+-                overrides=kwargs.get("postprocessor_overrides", {}),
+-                to_transition=policy_action_to_transition,
+-                to_output=transition_to_policy_action,
+-            ),
+-        )
++            )
++        except ImportError as exc:
++            # 部分公开 PI0.5 checkpoint 由另一版 LeRobot 导出，预处理器 JSON
++            # 中会保留一个已关闭的 relative_actions_processor。Evo-RL 当前版
++            # 不再注册该旧名称；此时用当前 PI0.5 工厂重建等价处理链，同时
++            # 保留训练数据统计量和相机重命名。其他 ImportError 必须继续抛出。
++            if not isinstance(policy_cfg, PI05Config) or "relative_actions_processor" not in str(exc):
++                raise
++
++            from lerobot.policies.pi05.processor_pi05 import make_pi05_pre_post_processors
++
++            preprocessor_overrides = kwargs.get("preprocessor_overrides") or {}
++            rename_overrides = preprocessor_overrides.get("rename_observations_processor", {})
++            logging.warning(
++                "PI0.5 checkpoint uses legacy relative_actions_processor; "
++                "rebuilding processors with the current Evo-RL implementation."
++            )
++            return make_pi05_pre_post_processors(
++                config=policy_cfg,
++                dataset_stats=kwargs.get("dataset_stats"),
++                rename_map=rename_overrides.get("rename_map", {}),
++            )
+ 
+     # Create a new processor based on policy type
+     if isinstance(policy_cfg, TDMPCConfig):
+diff --git a/src/lerobot/policies/pi05/modeling_pi05.py b/src/lerobot/policies/pi05/modeling_pi05.py
+index 61e4990..0a875a0 100644
+--- a/src/lerobot/policies/pi05/modeling_pi05.py
++++ b/src/lerobot/policies/pi05/modeling_pi05.py
+@@ -1263,18 +1263,37 @@ class PI05Policy(PreTrainedPolicy):
+         original_action_dim = self.config.output_features[ACTION].shape[0]
+         losses = losses[:, :, :original_action_dim]
+ 
++        valid_action_steps = None
++        if "action_is_pad" in batch:
++            valid_action_steps = (~batch["action_is_pad"]).to(
++                device=losses.device, dtype=losses.dtype
++            ).unsqueeze(-1)
++            losses = losses * valid_action_steps
++            valid_step_count = valid_action_steps.sum(dim=(0, 1)).clamp_min(1.0)
++            loss_per_dim = losses.sum(dim=(0, 1)) / valid_step_count
++        else:
++            loss_per_dim = losses.mean(dim=(0, 1))
++
+         loss_dict = {
+-            "loss_per_dim": losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist(),
++            "loss_per_dim": loss_per_dim.detach().cpu().numpy().tolist(),
+         }
+ 
+         if reduction == "none":
+-            # Return per-sample losses (B,) by averaging over time and action dims
+-            per_sample_loss = losses.mean(dim=(1, 2))
++            if valid_action_steps is None:
++                per_sample_loss = losses.mean(dim=(1, 2))
++            else:
++                denominator = (
++                    valid_action_steps.sum(dim=1).squeeze(-1) * original_action_dim
++                ).clamp_min(1.0)
++                per_sample_loss = losses.sum(dim=(1, 2)) / denominator
+             loss_dict["loss"] = per_sample_loss.mean().item()
+             return per_sample_loss, loss_dict
+         else:
+-            # Default: return scalar mean loss
+-            loss = losses.mean()
++            if valid_action_steps is None:
++                loss = losses.mean()
++            else:
++                denominator = (valid_action_steps.sum() * original_action_dim).clamp_min(1.0)
++                loss = losses.sum() / denominator
+             loss_dict["loss"] = loss.item()
+             return loss, loss_dict
+ 
+diff --git a/src/lerobot/policies/pi05/processor_pi05.py b/src/lerobot/policies/pi05/processor_pi05.py
+index e29bc4c..5f9d384 100644
+--- a/src/lerobot/policies/pi05/processor_pi05.py
++++ b/src/lerobot/policies/pi05/processor_pi05.py
+@@ -97,9 +97,33 @@ class Pi05PrepareStateTokenizerProcessorStep(ProcessorStep):
+         return features
+ 
+ 
++@ProcessorStepRegistry.register(name="pi05_clamp_quantiles_processor_step")
++@dataclass
++class Pi05ClampQuantilesProcessorStep(ProcessorStep):
++    """Clamp normalized PI0.5 state/actions to the quantile contract [-1, 1]."""
++
++    def __call__(self, transition: EnvTransition) -> EnvTransition:
++        transition = transition.copy()
++        observation = transition.get(TransitionKey.OBSERVATION)
++        if observation is not None and OBS_STATE in observation:
++            observation = observation.copy()
++            observation[OBS_STATE] = observation[OBS_STATE].clamp(-1.0, 1.0)
++            transition[TransitionKey.OBSERVATION] = observation
++        action = transition.get(TransitionKey.ACTION)
++        if action is not None:
++            transition[TransitionKey.ACTION] = action.clamp(-1.0, 1.0)
++        return transition
++
++    def transform_features(
++        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
++    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
++        return features
++
++
+ def make_pi05_pre_post_processors(
+     config: PI05Config,
+     dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,
++    rename_map: dict[str, str] | None = None,
+ ) -> tuple[
+     PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
+     PolicyProcessorPipeline[PolicyAction, PolicyAction],
+@@ -131,7 +155,9 @@ def make_pi05_pre_post_processors(
+ 
+     # Add remaining processors
+     input_steps: list[ProcessorStep] = [
+-        RenameObservationsProcessorStep(rename_map={}),  # To mimic the same processor as pretrained one
++        # 训练旧数据集时，可在这里把相机字段转换成 PI0.5 的标准名称。
++        # 默认空映射保持原有行为，避免影响已经使用标准字段的数据集。
++        RenameObservationsProcessorStep(rename_map=rename_map or {}),
+         AddBatchDimensionProcessorStep(),
+         # NOTE: NormalizerProcessorStep MUST come before Pi05PrepareStateTokenizerProcessorStep
+         # because the tokenizer step expects normalized state in [-1, 1] range for discretization
+@@ -140,6 +166,9 @@ def make_pi05_pre_post_processors(
+             norm_map=config.normalization_mapping,
+             stats=dataset_stats,
+         ),
++        # PI0.5 tokenization and flow targets assume normalized values lie in
++        # [-1,1]. Apply the same rule in training and inference.
++        Pi05ClampQuantilesProcessorStep(),
+         Pi05PrepareStateTokenizerProcessorStep(max_state_dim=config.max_state_dim),
+         TokenizerProcessorStep(
+             tokenizer_name="google/paligemma-3b-pt-224",
+@@ -151,6 +180,7 @@ def make_pi05_pre_post_processors(
+     ]
+ 
+     output_steps: list[ProcessorStep] = [
++        Pi05ClampQuantilesProcessorStep(),
+         UnnormalizerProcessorStep(
+             features=config.output_features, norm_map=config.normalization_mapping, stats=dataset_stats
+         ),
+diff --git a/src/lerobot/scripts/lerobot_human_inloop_record.py b/src/lerobot/scripts/lerobot_human_inloop_record.py
+index 790116c..c50d88b 100644
+--- a/src/lerobot/scripts/lerobot_human_inloop_record.py
++++ b/src/lerobot/scripts/lerobot_human_inloop_record.py
+@@ -128,7 +128,23 @@ class _HumanInloopFailureResetController:
+ 
+     def on_episode_outcome(self, robot: Any, teleop: Any, episode_success: str | None) -> None:
+         if episode_success in {EPISODE_FAILURE, EPISODE_SUCCESS} and self.failure_reset_pose is not None:
+-            _slow_reset_all_arms_to_pose(robot=robot, teleop=teleop, target_pose=self.failure_reset_pose)
++            reset_action_safety_state = getattr(robot, "reset_action_safety_state", None)
++            set_action_safety_tracking_enabled = getattr(
++                robot, "set_action_safety_tracking_enabled", None
++            )
++            if callable(set_action_safety_tracking_enabled):
++                set_action_safety_tracking_enabled(False)
++            if callable(reset_action_safety_state):
++                reset_action_safety_state()
++            try:
++                _slow_reset_all_arms_to_pose(
++                    robot=robot,
++                    teleop=teleop,
++                    target_pose=self.failure_reset_pose,
++                )
++            finally:
++                if callable(reset_action_safety_state):
++                    reset_action_safety_state()
+ 
+ 
+ @parser.wrap()
+@@ -138,26 +154,32 @@ def human_inloop_record(cfg: RecordConfig):
+ 
+     cfg.policy_sync_to_teleop = cfg.policy is not None
+     cfg.intervention_state_machine_enabled = cfg.policy is not None
++    cfg.manual_intervention_toggle_enabled = False
++    cfg.pause_toggle_key = "space"
+     cfg.enable_episode_outcome_labeling = True
++    cfg.episode_failure_enters_intervention = cfg.policy is not None
++    cfg.episode_start_requires_enter = cfg.policy is not None
++    cfg.episode_timeout_enabled = False
++    cfg.reset_timeout_enabled = False
++    cfg.reset_after_last_episode = True
++    cfg.policy_inference_seed = 1000
+     cfg.default_episode_success = "failure"
+     cfg.enable_collector_policy_id = True
+     if cfg.collector_policy_id_policy is None:
+         cfg.collector_policy_id_policy = infer_collector_policy_version(cfg.policy)
+-    if cfg.policy is not None:
+-        failure_reset_controller = _HumanInloopFailureResetController(cfg)
+-        cfg._on_record_connected = failure_reset_controller.on_record_connected
+-        cfg._on_record_episode_outcome = failure_reset_controller.on_episode_outcome
+-
+     logging.info(
+-        "Human-in-loop recording is enabled. Press '%s' to toggle takeover. "
+-        "Press '%s' to mark success and end, '%s' to mark failure and end. "
++        "Human-in-loop recording is enabled. Press '%s' to pause/resume all execution. "
++        "Press '%s' to mark success and end. Press '%s' for confirmed autonomous failure "
++        "and recovery. Press '%s' for preventive intervention before confirmed failure. "
++        "Finish either intervention with the success key. "
+         "Recorded `action` is the executed action. "
+         "Policy output (when policy is enabled) is stored in `complementary_info.policy_action`. "
+         "Collector source is stored in `complementary_info.collector_policy_id`. "
+         "ACP inference: enable=%s use_cfg=%s cfg_beta=%.3f.",
+-        cfg.intervention_toggle_key,
++        cfg.pause_toggle_key,
+         cfg.episode_success_key,
+         cfg.episode_failure_key,
++        cfg.episode_preventive_key,
+         cfg.acp_inference.enable,
+         cfg.acp_inference.use_cfg,
+         cfg.acp_inference.cfg_beta,
+diff --git a/src/lerobot/scripts/lerobot_record.py b/src/lerobot/scripts/lerobot_record.py
+index 3febecb..7f0f308 100644
+--- a/src/lerobot/scripts/lerobot_record.py
++++ b/src/lerobot/scripts/lerobot_record.py
+@@ -63,10 +63,15 @@ lerobot-record \
+ """
+ 
+ import logging
++import os
++import sys
++import time
+ from dataclasses import asdict, dataclass, field
+ from pathlib import Path
+ from pprint import pformat
+ 
++import torch
++
+ from lerobot.cameras import (  # noqa: F401
+     CameraConfig,  # noqa: F401
+ )
+@@ -129,8 +134,15 @@ from lerobot.utils.control_utils import (
+     sanity_check_dataset_name,
+     sanity_check_dataset_robot_compatibility,
+ )
++from lerobot.utils.hil_dataset_v1 import (
++    HILDatasetV1Recorder,
++    monotonic_ns,
++    validate_hil_dataset_v1,
++)
+ from lerobot.utils.import_utils import register_third_party_plugins
+ from lerobot.utils.recording_annotations import (
++    EPISODE_FAILURE,
++    EPISODE_SUCCESS,
+     infer_collector_policy_id,
+     normalize_episode_success_label,
+     resolve_episode_success_label,
+@@ -215,14 +227,43 @@ class RecordConfig:
+     policy_sync_parallel: bool = True
+     # Enable S0/S1/S2 intervention state machine when policy + teleop are both available.
+     intervention_state_machine_enabled: bool = True
++    # Allow the intervention toggle key to switch policy/teleop control manually.
++    manual_intervention_toggle_enabled: bool = True
+     # Keyboard key used to toggle entering/leaving intervention.
+     intervention_toggle_key: str = "i"
++    # Optional keyboard key used to pause/resume all policy and teleop execution.
++    pause_toggle_key: str | None = None
+     # Whether to capture episode-level success/failure labels from keyboard.
+     enable_episode_outcome_labeling: bool = False
+     # Keyboard key to mark the current episode as success and end it.
+     episode_success_key: str = "s"
+     # Keyboard key to mark the current episode as failure and end it.
+     episode_failure_key: str = "f"
++    # Optional key for a preventive takeover: the operator sees an unsafe or
++    # likely-wrong precursor, but no confirmed task failure has occurred yet.
++    episode_preventive_key: str | None = None
++    # If True, the failure key marks autonomous policy failure and forces human
++    # intervention; a later success key ends and saves the corrected episode.
++    episode_failure_enters_intervention: bool = False
++    # If True, wait for an explicit Enter key before the first policy episode.
++    # Enter at the end of RESET authorizes the following episode.
++    episode_start_requires_enter: bool = False
++    # If False, an episode continues until an explicit outcome key or Esc.
++    episode_timeout_enabled: bool = True
++    # If False, RESET continues until Enter or Esc.
++    reset_timeout_enabled: bool = True
++    # If True, also enter manual RESET after the final requested episode.
++    reset_after_last_episode: bool = False
++    # Optional deterministic base seed; episode N uses base_seed + N.
++    policy_inference_seed: int | None = None
++    # HIL Dataset v1 evidence logging.  These options are opt-in so ordinary
++    # lerobot-record datasets retain their existing schema.
++    hil_dataset_v1_enabled: bool = False
++    hil_object_id: str = "unknown"
++    hil_setup_id: str = "unknown"
++    # Ends only the current recovery episode as a terminal failure.  Arrow keys
++    # use the names "up"/"down"/"left"/"right".
++    episode_terminal_failure_key: str | None = None
+     # Optional fallback label used when no explicit success/failure key was pressed.
+     default_episode_success: str | None = None
+     # If True, require explicit or default episode labels before saving.
+@@ -253,27 +294,56 @@ class RecordConfig:
+         if self.teleop is None and self.policy is None:
+             raise ValueError("Choose a policy, a teleoperator or both to control the robot")
+         sanity_check_bimanual_piper_pair(self.robot, self.teleop)
+-        if not self.intervention_toggle_key or len(self.intervention_toggle_key) != 1:
+-            raise ValueError("`intervention_toggle_key` must be a single character.")
++        if not self.intervention_toggle_key or (
++            len(self.intervention_toggle_key) != 1
++            and self.intervention_toggle_key.lower() != "space"
++        ):
++            raise ValueError(
++                "`intervention_toggle_key` must be a single character or 'space'."
++            )
++        if self.pause_toggle_key is not None and (
++            not self.pause_toggle_key
++            or (len(self.pause_toggle_key) != 1 and self.pause_toggle_key.lower() != "space")
++        ):
++            raise ValueError("`pause_toggle_key` must be a single character, 'space', or null.")
+ 
+         if self.enable_episode_outcome_labeling:
+             label_key_bindings = {
+                 "episode_success_key": self.episode_success_key,
+                 "episode_failure_key": self.episode_failure_key,
+             }
++            if self.episode_preventive_key is not None:
++                label_key_bindings["episode_preventive_key"] = self.episode_preventive_key
+             for key_name, key_value in label_key_bindings.items():
+-                if not key_value or len(key_value) != 1:
+-                    raise ValueError(f"`{key_name}` must be a single character.")
++                if not key_value or (
++                    len(key_value) != 1
++                    and key_value.lower() not in {"up", "down", "left", "right"}
++                ):
++                    raise ValueError(
++                        f"`{key_name}` must be a single character or an arrow name."
++                    )
+ 
+             normalized_keys = [
+                 self.intervention_toggle_key.lower(),
+                 self.episode_success_key.lower(),
+                 self.episode_failure_key.lower(),
+             ]
++            if self.episode_preventive_key is not None:
++                normalized_keys.append(self.episode_preventive_key.lower())
++            if self.pause_toggle_key is not None:
++                normalized_keys.append(self.pause_toggle_key.lower())
+             if len(set(normalized_keys)) != len(normalized_keys):
+                 raise ValueError(
+-                    "`intervention_toggle_key`, `episode_success_key`, and `episode_failure_key` must be distinct."
++                    "Intervention, pause, success, and failure keys must be distinct."
+                 )
++            if self.episode_terminal_failure_key is not None:
++                terminal_key = self.episode_terminal_failure_key.lower()
++                if len(terminal_key) != 1 and terminal_key not in {"up", "down", "left", "right"}:
++                    raise ValueError(
++                        "`episode_terminal_failure_key` must be one character, an arrow name, or null."
++                    )
++                if terminal_key in normalized_keys:
++                    raise ValueError("The terminal-failure key must be distinct from all other controls.")
+ 
+         if self.default_episode_success is not None:
+             self.default_episode_success = normalize_episode_success_label(self.default_episode_success)
+@@ -318,6 +388,35 @@ def _ensure_human_inloop_compatible_features(
+     }
+ 
+ 
++def _ensure_hil_v1_frame_features(
++    dataset_features: dict[str, dict], *, action_feature_names: list[str]
++) -> None:
++    """Add lightweight facts that must stay row-aligned with LeRobot frames."""
++    scalar_int64 = (
++        "hil.t_mono_ns",
++        "hil.observation_start_mono_ns",
++        "hil.observation_end_mono_ns",
++        "hil.base_camera_received_mono_ns",
++        "hil.wrist_camera_received_mono_ns",
++        "hil.action_send_start_mono_ns",
++        "hil.action_send_end_mono_ns",
++        "hil.decision_step",
++        "hil.continuity_segment_id",
++    )
++    for key in scalar_int64:
++        dataset_features[key] = {"dtype": "int64", "shape": (1,), "names": [key.rsplit(".", 1)[-1]]}
++    for key in ("hil.episode_uuid", "hil.decision_id", "hil.control_source"):
++        dataset_features[key] = {"dtype": "string", "shape": (1,), "names": [key.rsplit(".", 1)[-1]]}
++    for key in ("hil.policy_action_valid", "hil.safety_modified"):
++        dataset_features[key] = {"dtype": "float32", "shape": (1,), "names": [key.rsplit(".", 1)[-1]]}
++    for key in ("hil.policy_step_physical", "hil.safety_limited_action"):
++        dataset_features[key] = {
++            "dtype": "float32",
++            "shape": (len(action_feature_names),),
++            "names": action_feature_names,
++        }
++
++
+ @parser.wrap()
+ def record(cfg: RecordConfig) -> LeRobotDataset:
+     init_logging()
+@@ -325,6 +424,13 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
+         raise ValueError(
+             "`require_episode_success_label=true` requires `enable_episode_outcome_labeling=true`."
+         )
++    if cfg.hil_dataset_v1_enabled:
++        if cfg.resume:
++            raise ValueError(
++                "HIL Dataset v1 currently requires a fresh dataset root per session; resume would mix identities."
++            )
++        if cfg.hil_object_id in {"", "unknown"} or cfg.hil_setup_id in {"", "unknown"}:
++            raise ValueError("HIL Dataset v1 requires explicit non-'unknown' object_id and setup_id.")
+     logging.info(pformat(asdict(cfg)))
+     if cfg.display_data:
+         init_rerun(session_name="recording", ip=cfg.display_ip, port=cfg.display_port)
+@@ -357,6 +463,8 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
+         action_names = dataset_features[ACTION]["names"]
+         action_names = list(robot.action_features) if action_names is None else list(action_names)
+         _ensure_human_inloop_compatible_features(dataset_features, action_feature_names=action_names)
++        if cfg.hil_dataset_v1_enabled:
++            _ensure_hil_v1_frame_features(dataset_features, action_feature_names=action_names)
+     if cfg.enable_collector_policy_id:
+         dataset_features["complementary_info.collector_policy_id"] = {
+             "dtype": "string",
+@@ -367,6 +475,8 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
+     dataset = None
+     listener = None
+     policy_sync_executor = None
++    hil_recorder = None
++    events: dict[str, Any] = {}
+ 
+     try:
+         if cfg.resume:
+@@ -423,6 +533,38 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
+         )
+         collector_policy_id_human = cfg.collector_policy_id_human
+ 
++        if cfg.hil_dataset_v1_enabled:
++            calibration_paths = []
++            for config in (cfg.robot, cfg.teleop):
++                if config is None:
++                    continue
++                calibration_dir = getattr(config, "calibration_dir", None)
++                config_id = getattr(config, "id", None)
++                if calibration_dir is not None and config_id:
++                    calibration_paths.append(Path(calibration_dir) / f"{config_id}.json")
++            policy_path = None
++            if cfg.policy is not None and cfg.policy.pretrained_path is not None:
++                policy_path = Path(cfg.policy.pretrained_path)
++            hil_recorder = HILDatasetV1Recorder(
++                dataset_root=Path(dataset.root),
++                manifest_config=asdict(cfg),
++                object_id=cfg.hil_object_id,
++                setup_id=cfg.hil_setup_id,
++                policy_path=policy_path,
++                calibration_paths=calibration_paths,
++                code_roots=[Path(__file__).resolve().parents[3]],
++                source_paths=[
++                    path
++                    for path in (
++                        Path(sys.argv[0]).resolve(),
++                        Path(os.environ["HIL_LAUNCHER_PATH"]).resolve()
++                        if os.environ.get("HIL_LAUNCHER_PATH")
++                        else None,
++                    )
++                    if path is not None
++                ],
++            )
++
+         robot.connect()
+         if teleop is not None:
+             teleop.connect()
+@@ -445,14 +587,55 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
+ 
+         listener, events = init_keyboard_listener(
+             intervention_toggle_key=cfg.intervention_toggle_key,
++            intervention_toggle_enabled=cfg.manual_intervention_toggle_enabled,
++            pause_toggle_key=cfg.pause_toggle_key,
+             episode_success_key=cfg.episode_success_key if cfg.enable_episode_outcome_labeling else None,
+             episode_failure_key=cfg.episode_failure_key if cfg.enable_episode_outcome_labeling else None,
++            episode_preventive_key=(
++                cfg.episode_preventive_key if cfg.enable_episode_outcome_labeling else None
++            ),
++            failure_enters_intervention=cfg.episode_failure_enters_intervention,
++            episode_terminal_failure_key=cfg.episode_terminal_failure_key,
+         )
+ 
+         with VideoEncodingManager(dataset):
+             recorded_episodes = 0
+             while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
++                if cfg.episode_start_requires_enter:
++                    if not events.get("episode_start_authorized", False):
++                        events["phase"] = "waiting_start"
++                        events["confirm_reset"] = False
++                        log_say(
++                            f"Episode {dataset.num_episodes} ready. Press Enter to start policy inference.",
++                            cfg.play_sounds,
++                        )
++                        while not events.get("confirm_reset", False) and not events["stop_recording"]:
++                            time.sleep(0.05)
++                        if events["stop_recording"]:
++                            break
++                    events["episode_start_authorized"] = False
++                    events["confirm_reset"] = False
++
+                 events["episode_outcome"] = None
++                events["phase"] = "recording"
++                events["enter_intervention"] = False
++                events["failure_recovery_active"] = False
++                events["policy_failure_detected"] = False
++                events["preventive_intervention_detected"] = False
++                events["intervention_kind"] = None
++                events["episode_had_intervention"] = False
++                events["confirm_intervention"] = False
++                events["intervention_handover_pending"] = False
++                events["confirm_reset"] = False
++                episode_seed = None
++                if cfg.policy_inference_seed is not None:
++                    episode_seed = cfg.policy_inference_seed + dataset.num_episodes
++                    torch.manual_seed(episode_seed)
++                    logging.info("Policy inference seed for episode %s: %s", dataset.num_episodes, episode_seed)
++                if hil_recorder is not None:
++                    events["hil_episode_uuid"] = hil_recorder.start_episode(
++                        dataset.num_episodes, seed=episode_seed, task_text=cfg.dataset.single_task
++                    )
+                 log_say(f"Recording episode {dataset.num_episodes}", cfg.play_sounds)
+                 record_loop(
+                     robot=robot,
+@@ -466,17 +649,21 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
+                     preprocessor=preprocessor,
+                     postprocessor=postprocessor,
+                     dataset=dataset,
+-                    control_time_s=cfg.dataset.episode_time_s,
++                    control_time_s=(
++                        cfg.dataset.episode_time_s if cfg.episode_timeout_enabled else None
++                    ),
+                     single_task=cfg.dataset.single_task,
+                     display_data=cfg.display_data,
+                     display_compressed_images=display_compressed_images,
+                     policy_sync_executor=policy_sync_executor,
+                     intervention_state_machine_enabled=cfg.intervention_state_machine_enabled,
++                    manual_intervention_toggle_enabled=cfg.manual_intervention_toggle_enabled,
+                     collector_policy_id_policy=collector_policy_id_policy,
+                     collector_policy_id_human=collector_policy_id_human,
+                     acp_inference=cfg.acp_inference,
+                     communication_retry_timeout_s=cfg.communication_retry_timeout_s,
+                     communication_retry_interval_s=cfg.communication_retry_interval_s,
++                    hil_recorder=hil_recorder,
+                 )
+ 
+                 episode_success = None
+@@ -492,17 +679,147 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
+                             dataset.num_episodes,
+                             episode_success,
+                         )
++                    if episode_success == EPISODE_FAILURE:
++                        events["policy_failure_detected"] = True
+ 
+                 on_episode_outcome = getattr(cfg, "_on_record_episode_outcome", None)
+                 if callable(on_episode_outcome):
+                     on_episode_outcome(robot, teleop, episode_success)
+ 
++                # HIL v1 commits task data before RESET.  The commit journal is
++                # the cross-file source of truth: only "committed" episodes are
++                # admitted by the integrity checker.
++                if hil_recorder is not None and not events["rerecord_episode"]:
++                    task_was_aborted = bool(events.get("stop_recording", False))
++                    hil_recorder.finish_decision(
++                        "session_stop"
++                        if task_was_aborted
++                        else ("task_success" if episode_success == EPISODE_SUCCESS else "terminal_failure")
++                    )
++                    hil_recorder.drain_keyboard_events(
++                        events,
++                        frame_index=max(int((dataset.episode_buffer or {}).get("size", 0)) - 1, 0),
++                    )
++                    hil_recorder.record_event(
++                        "episode_end",
++                        frame_index=max(int((dataset.episode_buffer or {}).get("size", 0)) - 1, 0),
++                        phase="recording",
++                    )
++                    hil_recorder.commit_status("ending")
++                    hil_recorder.flush_wals()
++                    hil_recorder.commit_status("sidecar_flushed")
++
++                    policy_failure_detected = bool(events.get("policy_failure_detected", False))
++                    preventive_intervention_detected = bool(
++                        events.get("preventive_intervention_detected", False)
++                    )
++                    episode_had_intervention = bool(events.get("episode_had_intervention", False))
++                    assistance = (
++                        "human_preventive"
++                        if preventive_intervention_detected
++                        else ("human_recovery" if episode_had_intervention else "none")
++                    )
++                    extra_episode_metadata = {
++                        "episode_success": episode_success,
++                        "policy_failure_detected": policy_failure_detected,
++                        "required_intervention": episode_had_intervention,
++                        "autonomous_policy_success": bool(
++                            episode_success == EPISODE_SUCCESS
++                            and not policy_failure_detected
++                            and not episode_had_intervention
++                        ),
++                        "intervention_recovery_success": bool(
++                            episode_success == EPISODE_SUCCESS
++                            and policy_failure_detected
++                            and episode_had_intervention
++                        ),
++                        "preventive_intervention_detected": preventive_intervention_detected,
++                        "intervention_preventive_success": bool(
++                            episode_success == EPISODE_SUCCESS
++                            and preventive_intervention_detected
++                            and episode_had_intervention
++                        ),
++                        "hil_session_id": hil_recorder.session_id,
++                        "hil_episode_uuid": hil_recorder.episode_uuid,
++                        "hil_schema_version": "1.0",
++                    }
++                    hil_recorder.commit_status("lerobot_save_started")
++                    dataset.save_episode(extra_episode_metadata=extra_episode_metadata)
++                    hil_recorder.commit_status("lerobot_saved")
++                    hil_recorder.write_episode_record(
++                        {
++                            "collection_mode": "standard_hil",
++                            "task_outcome": (
++                                "aborted"
++                                if task_was_aborted
++                                else ("success" if episode_success == EPISODE_SUCCESS else "failure")
++                            ),
++                            "assistance": assistance,
++                            "recovery_attempted": bool(
++                                episode_had_intervention and not preventive_intervention_detected
++                            ),
++                            "recovery_success": bool(
++                                episode_success == EPISODE_SUCCESS
++                                and episode_had_intervention
++                                and not preventive_intervention_detected
++                            ),
++                            "preventive_intervention_attempted": preventive_intervention_detected,
++                            "preventive_intervention_success": bool(
++                                episode_success == EPISODE_SUCCESS
++                                and preventive_intervention_detected
++                            ),
++                            "start_mono_ns": hil_recorder.episode_start_mono_ns,
++                            "end_mono_ns": monotonic_ns(),
++                            "task_text": cfg.dataset.single_task,
++                            "seed": episode_seed,
++                        }
++                    )
++                    validation = validate_hil_dataset_v1(
++                        Path(dataset.root),
++                        require_all_committed=False,
++                        check_lerobot_files=False,
++                    )
++                    if validation["errors"]:
++                        hil_recorder.commit_status(
++                            "validation_failed", details={"errors": validation["errors"]}
++                        )
++                        raise RuntimeError(
++                            "HIL Dataset v1 episode failed integrity validation: "
++                            + "; ".join(validation["errors"])
++                        )
++                    hil_recorder.commit_status(
++                        "validated", details={"warnings": validation["warnings"]}
++                    )
++                    hil_recorder.commit_status("committed")
++                    hil_recorder.materialize_parquet()
++                    recorded_episodes += 1
++
+                 # Execute a few seconds without recording to give time to manually reset the environment
+                 # Skip reset for the last episode to be recorded
+                 if not events["stop_recording"] and (
+-                    (recorded_episodes < cfg.dataset.num_episodes - 1) or events["rerecord_episode"]
++                    cfg.reset_after_last_episode
++                    or (recorded_episodes < cfg.dataset.num_episodes - 1)
++                    or events["rerecord_episode"]
+                 ):
+-                    log_say("Reset the environment", cfg.play_sounds)
++                    log_say(
++                        "Policy stopped. RESET teleoperation is active. "
++                        "Manually restore the arm and scene, then press Enter.",
++                        cfg.play_sounds,
++                    )
++                    events["phase"] = "reset"
++                    # Consume an intervention toggle left over from RECORDING.
++                    # A fresh Enter during RESET confirms that the operator has
++                    # restored the arm and scene and starts the next episode.
++                    events["toggle_intervention"] = False
++                    events["confirm_reset"] = False
++                    events["enter_intervention"] = False
++                    events["failure_recovery_active"] = False
++                    events["preventive_intervention_detected"] = False
++                    events["intervention_kind"] = None
++                    events["confirm_intervention"] = False
++                    events["intervention_handover_pending"] = False
++                    if hil_recorder is not None:
++                        hil_recorder.record_event("reset_start", phase="reset")
+ 
+                     # reset g1 robot
+                     if robot.name == "unitree_g1":
+@@ -516,41 +833,106 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
+                         robot_action_processor=robot_action_processor,
+                         robot_observation_processor=robot_observation_processor,
+                         teleop=teleop,
+-                        control_time_s=cfg.dataset.reset_time_s,
++                        control_time_s=(
++                            cfg.dataset.reset_time_s if cfg.reset_timeout_enabled else None
++                        ),
+                         single_task=cfg.dataset.single_task,
+                         display_data=cfg.display_data,
+                         policy_sync_executor=policy_sync_executor,
+                         intervention_state_machine_enabled=cfg.intervention_state_machine_enabled,
++                        manual_intervention_toggle_enabled=cfg.manual_intervention_toggle_enabled,
+                         collector_policy_id_policy=collector_policy_id_policy,
+                         collector_policy_id_human=collector_policy_id_human,
+                         acp_inference=cfg.acp_inference,
+                         communication_retry_timeout_s=cfg.communication_retry_timeout_s,
+                         communication_retry_interval_s=cfg.communication_retry_interval_s,
++                        hil_recorder=hil_recorder,
+                     )
+ 
++                if hil_recorder is not None and not events["rerecord_episode"]:
++                    hil_recorder.drain_keyboard_events(events, frame_index=0)
++                    hil_recorder.complete_episode()
++
+                 if events["rerecord_episode"]:
+                     log_say("Re-record episode", cfg.play_sounds)
+                     events["rerecord_episode"] = False
+                     events["exit_early"] = False
+                     events["episode_outcome"] = None
++                    events["enter_intervention"] = False
++                    events["failure_recovery_active"] = False
++                    events["policy_failure_detected"] = False
++                    events["preventive_intervention_detected"] = False
++                    events["intervention_kind"] = None
++                    events["episode_had_intervention"] = False
++                    events["confirm_intervention"] = False
++                    events["intervention_handover_pending"] = False
++                    events["confirm_reset"] = False
+                     dataset.clear_episode_buffer()
++                    if hil_recorder is not None:
++                        hil_recorder.record_event("episode_abandoned", source="collector")
++                        hil_recorder.complete_episode()
+                     continue
+ 
+-                extra_episode_metadata = (
+-                    {"episode_success": episode_success} if cfg.enable_episode_outcome_labeling else None
+-                )
+-                dataset.save_episode(extra_episode_metadata=extra_episode_metadata)
+-                recorded_episodes += 1
++                extra_episode_metadata = None
++                if cfg.enable_episode_outcome_labeling:
++                    policy_failure_detected = bool(events.get("policy_failure_detected", False))
++                    episode_had_intervention = bool(events.get("episode_had_intervention", False))
++                    extra_episode_metadata = {
++                        "episode_success": episode_success,
++                        "policy_failure_detected": policy_failure_detected,
++                        "required_intervention": episode_had_intervention,
++                        "autonomous_policy_success": bool(
++                            episode_success == EPISODE_SUCCESS
++                            and not policy_failure_detected
++                            and not episode_had_intervention
++                        ),
++                        "intervention_recovery_success": bool(
++                            episode_success == EPISODE_SUCCESS
++                            and policy_failure_detected
++                            and episode_had_intervention
++                        ),
++                    }
++                if hil_recorder is None:
++                    dataset.save_episode(extra_episode_metadata=extra_episode_metadata)
++                    recorded_episodes += 1
+     finally:
+         log_say("Stop recording", cfg.play_sounds, blocking=True)
+ 
+-        if dataset:
+-            dataset.finalize()
+-            logging.info(
+-                "To inspect the recorded dataset, run:\n"
+-                "  lerobot-dataset-report --dataset %s",
+-                dataset.repo_id,
++        try:
++            if dataset:
++                dataset.finalize()
++                logging.info(
++                    "To inspect the recorded dataset, run:\n"
++                    "  lerobot-dataset-report --dataset %s",
++                    dataset.repo_id,
++                )
++        finally:
++            if hil_recorder is not None:
++                hil_recorder.close(session_complete=not events.get("stop_recording", False))
++
++        # The LeRobot Parquet footer and video metadata only become readable
++        # after dataset.finalize().  Run the full cross-store check here; the
++        # per-episode check above intentionally validates durable HIL WALs only.
++        if hil_recorder is not None and dataset is not None:
++            final_validation = validate_hil_dataset_v1(
++                Path(dataset.root),
++                require_all_committed=True,
++                check_lerobot_files=True,
+             )
++            if final_validation["errors"]:
++                logging.error(
++                    "HIL Dataset v1 post-finalize integrity validation failed: %s",
++                    "; ".join(final_validation["errors"]),
++                )
++            else:
++                logging.info(
++                    "HIL Dataset v1 post-finalize integrity validation passed%s.",
++                    (
++                        f" with warnings: {'; '.join(final_validation['warnings'])}"
++                        if final_validation["warnings"]
++                        else ""
++                    ),
++                )
+ 
+         if policy_sync_executor is not None:
+             policy_sync_executor.shutdown()
+diff --git a/src/lerobot/scripts/lerobot_train.py b/src/lerobot/scripts/lerobot_train.py
+index cc863ce..d14b5b2 100644
+--- a/src/lerobot/scripts/lerobot_train.py
++++ b/src/lerobot/scripts/lerobot_train.py
+@@ -122,12 +122,14 @@ def update_policy(
+     accelerator.backward(loss)
+ 
+     # Clip gradients if specified
+-    if grad_clip_norm > 0:
++    if accelerator.sync_gradients and grad_clip_norm > 0:
+         grad_norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm)
+-    else:
++    elif accelerator.sync_gradients:
+         grad_norm = torch.nn.utils.clip_grad_norm_(
+             policy.parameters(), float("inf"), error_if_nonfinite=False
+         )
++    else:
++        grad_norm = torch.zeros((), device=loss.device)
+ 
+     # Optimizer step
+     with lock if lock is not None else nullcontext():
+@@ -136,11 +138,13 @@ def update_policy(
+     optimizer.zero_grad()
+ 
+     # Step through pytorch scheduler at every batch instead of epoch
+-    if lr_scheduler is not None:
++    if lr_scheduler is not None and accelerator.sync_gradients:
+         lr_scheduler.step()
+ 
+     # Update internal buffers if policy has update method
+-    if has_method(accelerator.unwrap_model(policy, keep_fp32_wrapper=True), "update"):
++    if accelerator.sync_gradients and has_method(
++        accelerator.unwrap_model(policy, keep_fp32_wrapper=True), "update"
++    ):
+         accelerator.unwrap_model(policy, keep_fp32_wrapper=True).update()
+ 
+     train_metrics.loss = loss.item()
+@@ -186,6 +190,7 @@ def train(
+         force_cpu = cfg.policy.device == "cpu"
+         accelerator = Accelerator(
+             step_scheduler_with_optimizer=False,
++            gradient_accumulation_steps=cfg.gradient_accumulation_steps,
+             kwargs_handlers=[ddp_kwargs],
+             cpu=force_cpu,
+         )
+@@ -364,8 +369,14 @@ def train(
+         logging.info(f"{dataset.num_frames=} ({format_big_number(dataset.num_frames)})")
+         logging.info(f"{dataset.num_episodes=}")
+         num_processes = accelerator.num_processes
+-        effective_bs = cfg.batch_size * num_processes
+-        logging.info(f"Effective batch size: {cfg.batch_size} x {num_processes} = {effective_bs}")
++        effective_bs = cfg.batch_size * num_processes * cfg.gradient_accumulation_steps
++        logging.info(
++            "Effective batch size: %d x %d processes x %d accumulation = %d",
++            cfg.batch_size,
++            num_processes,
++            cfg.gradient_accumulation_steps,
++            effective_bs,
++        )
+         logging.info(f"{num_learnable_params=} ({format_big_number(num_learnable_params)})")
+         logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
+ 
+@@ -412,7 +423,9 @@ def train(
+     }
+ 
+     # Use effective batch size for proper epoch calculation in distributed training
+-    effective_batch_size = cfg.batch_size * accelerator.num_processes
++    effective_batch_size = (
++        cfg.batch_size * accelerator.num_processes * cfg.gradient_accumulation_steps
++    )
+     train_tracker = MetricsTracker(
+         effective_batch_size,
+         dataset.num_frames,
+@@ -436,7 +449,7 @@ def train(
+         if key not in prompt_keys:
+             prompt_keys.append(key)
+ 
+-    for _ in range(step, cfg.steps):
++    while step < cfg.steps:
+         start_time = time.perf_counter()
+         batch = next(dl_iter)
+         if acp_raw_batch_hook is not None:
+@@ -461,16 +474,23 @@ def train(
+                     break
+         train_tracker.dataloading_s = time.perf_counter() - start_time
+ 
+-        train_tracker, output_dict = update_policy(
+-            train_tracker,
+-            policy,
+-            batch,
+-            optimizer,
+-            cfg.optimizer.grad_clip_norm,
+-            accelerator=accelerator,
+-            lr_scheduler=lr_scheduler,
+-            rabc_weights_provider=rabc_weights,
+-        )
++        with accelerator.accumulate(policy):
++            train_tracker, output_dict = update_policy(
++                train_tracker,
++                policy,
++                batch,
++                optimizer,
++                cfg.optimizer.grad_clip_norm,
++                accelerator=accelerator,
++                lr_scheduler=lr_scheduler,
++                rabc_weights_provider=rabc_weights,
++            )
++
++        # Accelerate suppresses optimizer/scheduler steps on intermediate
++        # micro-batches. Checkpoint, logging and ``steps`` advance only after a
++        # real optimizer update.
++        if not accelerator.sync_gradients:
++            continue
+ 
+         # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we
+         # increment `step` here.
+diff --git a/src/lerobot/scripts/lerobot_value_infer.py b/src/lerobot/scripts/lerobot_value_infer.py
+index c498df6..355d72e 100644
+--- a/src/lerobot/scripts/lerobot_value_infer.py
++++ b/src/lerobot/scripts/lerobot_value_infer.py
+@@ -138,6 +138,7 @@ def _load_dataset_distributed(cfg: ValueInferencePipelineConfig, accelerator: Ac
+         "episodes": cfg.dataset.episodes,
+         "revision": cfg.dataset.revision,
+         "download_videos": cfg.dataset.download_videos,
++        "video_backend": cfg.dataset.video_backend,
+     }
+ 
+     if accelerator.is_main_process:
+@@ -303,6 +304,7 @@ def _binarize_advantages(
+     thresholds: dict[int, float],
+     interventions: np.ndarray,
+     force_intervention_positive: bool,
++    intervention_episode_success: np.ndarray | None = None,
+ ) -> np.ndarray:
+     indicators = np.zeros_like(advantages, dtype=np.int64)
+ 
+@@ -313,7 +315,17 @@ def _binarize_advantages(
+ 
+     if force_intervention_positive:
+         intervention_mask = interventions.astype(np.float32) > 0.5
+-        indicators[intervention_mask] = 1
++        if intervention_episode_success is None:
++            indicators[intervention_mask] = 1
++        else:
++            if intervention_episode_success.shape != indicators.shape:
++                raise ValueError("'intervention_episode_success' must match the advantage shape.")
++            # A human action is positive only for the state in which it was taken and only
++            # when that intervention episode ultimately succeeded. Failed recovery actions
++            # must not become positive merely because a human controlled the robot.
++            indicators[intervention_mask] = intervention_episode_success[intervention_mask].astype(
++                np.int64
++            )
+ 
+     return indicators
+ 
+@@ -642,12 +654,19 @@ def run_value_inference_pipeline(
+                 advantages=advantages,
+                 positive_ratio=cfg.acp.positive_ratio,
+             )
++            intervention_episode_success = None
++            if cfg.acp.gate_intervention_by_episode_success:
++                intervention_episode_success = np.asarray(
++                    [episode_info[int(ep_idx)].success for ep_idx in episode_indices],
++                    dtype=np.bool_,
++                )
+             indicators = _binarize_advantages(
+                 task_indices=task_indices,
+                 advantages=advantages,
+                 thresholds=thresholds,
+                 interventions=interventions,
+                 force_intervention_positive=cfg.acp.force_intervention_positive,
++                intervention_episode_success=intervention_episode_success,
+             )
+ 
+             indicator_positive_ratio = float(np.mean(indicators.astype(np.float32)))
+diff --git a/src/lerobot/scripts/lerobot_value_train.py b/src/lerobot/scripts/lerobot_value_train.py
+index 91e4610..5acd105 100644
+--- a/src/lerobot/scripts/lerobot_value_train.py
++++ b/src/lerobot/scripts/lerobot_value_train.py
+@@ -49,22 +49,26 @@ def update_policy(
+ 
+     accelerator.backward(loss)
+ 
+-    if grad_clip_norm > 0:
++    if accelerator.sync_gradients and grad_clip_norm > 0:
+         grad_norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm)
+-    else:
++    elif accelerator.sync_gradients:
+         grad_norm = torch.nn.utils.clip_grad_norm_(
+             policy.parameters(), float("inf"), error_if_nonfinite=False
+         )
++    else:
++        grad_norm = torch.zeros((), device=loss.device)
+ 
+     with lock if lock is not None else nullcontext():
+         optimizer.step()
+ 
+     optimizer.zero_grad()
+ 
+-    if lr_scheduler is not None:
++    if lr_scheduler is not None and accelerator.sync_gradients:
+         lr_scheduler.step()
+ 
+-    if has_method(accelerator.unwrap_model(policy, keep_fp32_wrapper=True), "update"):
++    if accelerator.sync_gradients and has_method(
++        accelerator.unwrap_model(policy, keep_fp32_wrapper=True), "update"
++    ):
+         accelerator.unwrap_model(policy, keep_fp32_wrapper=True).update()
+ 
+     train_metrics.loss = loss.item()
+@@ -84,10 +88,14 @@ def value_train(
+     if accelerator is None:
+         from accelerate.utils import DistributedDataParallelKwargs
+ 
+-        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
++        # Pistar06 contains conditional branches whose parameters are not all used by
++        # every value-training forward pass. DDP must explicitly tolerate those
++        # parameters; otherwise the second optimization step fails during reduction.
++        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+         force_cpu = cfg.value.device == "cpu"
+         accelerator = Accelerator(
+             step_scheduler_with_optimizer=False,
++            gradient_accumulation_steps=cfg.gradient_accumulation_steps,
+             kwargs_handlers=[ddp_kwargs],
+             cpu=force_cpu,
+         )
+@@ -190,8 +198,14 @@ def value_train(
+         logging.info(f"{dataset.num_frames=} ({format_big_number(dataset.num_frames)})")
+         logging.info(f"{dataset.num_episodes=}")
+         num_processes = accelerator.num_processes
+-        effective_bs = cfg.batch_size * num_processes
+-        logging.info(f"Effective batch size: {cfg.batch_size} x {num_processes} = {effective_bs}")
++        effective_bs = cfg.batch_size * num_processes * cfg.gradient_accumulation_steps
++        logging.info(
++            "Effective batch size: %d x %d x %d = %d",
++            cfg.batch_size,
++            num_processes,
++            cfg.gradient_accumulation_steps,
++            effective_bs,
++        )
+         logging.info(f"{num_learnable_params=} ({format_big_number(num_learnable_params)})")
+         logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
+ 
+@@ -222,7 +236,9 @@ def value_train(
+         "dataloading_s": AverageMeter("data_s", ":.3f"),
+     }
+ 
+-    effective_batch_size = cfg.batch_size * accelerator.num_processes
++    effective_batch_size = (
++        cfg.batch_size * accelerator.num_processes * cfg.gradient_accumulation_steps
++    )
+     train_tracker = MetricsTracker(
+         effective_batch_size,
+         dataset.num_frames,
+@@ -239,7 +255,7 @@ def value_train(
+ 
+     logged_first_prompt = False
+ 
+-    for _ in range(step, cfg.steps):
++    while step < cfg.steps:
+         start_time = time.perf_counter()
+         batch = next(dl_iter)
+         if value_target_raw_batch_hook is not None:
+@@ -260,15 +276,19 @@ def value_train(
+ 
+         train_tracker.dataloading_s = time.perf_counter() - start_time
+ 
+-        train_tracker, output_dict = update_policy(
+-            train_tracker,
+-            value_model,
+-            batch,
+-            optimizer,
+-            cfg.optimizer.grad_clip_norm,
+-            accelerator=accelerator,
+-            lr_scheduler=lr_scheduler,
+-        )
++        with accelerator.accumulate(value_model):
++            train_tracker, output_dict = update_policy(
++                train_tracker,
++                value_model,
++                batch,
++                optimizer,
++                cfg.optimizer.grad_clip_norm,
++                accelerator=accelerator,
++                lr_scheduler=lr_scheduler,
++            )
++
++        if not accelerator.sync_gradients:
++            continue
+ 
+         step += 1
+         train_tracker.step()
+diff --git a/src/lerobot/scripts/recording_loop.py b/src/lerobot/scripts/recording_loop.py
+index 63637e3..a05f786 100644
+--- a/src/lerobot/scripts/recording_loop.py
++++ b/src/lerobot/scripts/recording_loop.py
+@@ -109,11 +109,13 @@ def record_loop(
+     display_compressed_images: bool = False,
+     policy_sync_executor: PolicySyncDualArmExecutor | None = None,
+     intervention_state_machine_enabled: bool = True,
++    manual_intervention_toggle_enabled: bool = True,
+     collector_policy_id_policy: str = "policy",
+     collector_policy_id_human: str = "human",
+     acp_inference: ACPInferenceConfig | None = None,
+     communication_retry_timeout_s: float = 2.0,
+     communication_retry_interval_s: float = 0.1,
++    hil_recorder: Any | None = None,
+ ):
+     if acp_inference is None:
+         acp_inference = ACPInferenceConfig()
+@@ -161,6 +163,17 @@ def record_loop(
+     intervention_state = INTERVENTION_STATE_POLICY
+     last_teleop_action: RobotAction | None = None
+     teleop_fallback_warned = False
++    consecutive_policy_rejections = 0
++    max_policy_rejections = 3
++    pause_was_active = False
++
++    # Real-robot safety wrappers may track whether the previous command made
++    # physical progress. A new RECORDING or RESET phase must not inherit a
++    # target from the preceding phase, otherwise a valid reset motion can be
++    # misclassified as a tracking failure.
++    reset_action_safety_state = getattr(robot, "reset_action_safety_state", None)
++    if callable(reset_action_safety_state):
++        reset_action_safety_state()
+ 
+     teleop_arm_for_mode_switch: Any | None = None
+     if isinstance(teleop, Teleoperator):
+@@ -175,9 +188,43 @@ def record_loop(
+             return
+         teleop_arm_for_mode_switch.set_manual_control(enabled)
+ 
++    def request_safe_intervention_handover(reason: str, *, intervention_kind: str = "recovery") -> None:
++        """Stop policy execution while the powered leader waits for operator support."""
++        events["intervention_handover_pending"] = True
++        events["confirm_intervention"] = False
++        events["phase"] = "intervention_handover"
++        events["intervention_kind"] = intervention_kind
++        events["policy_failure_detected"] = intervention_kind != "preventive"
++        events["preventive_intervention_detected"] = intervention_kind == "preventive"
++        events["failure_recovery_active"] = True
++        events["episode_had_intervention"] = True
++        if hil_recorder is not None:
++            hil_recorder.finish_decision("human_takeover")
++            hil_recorder.continuity_segment_id += 1
++            hil_recorder.record_event(
++                "hold_start",
++                frame_index=max(int((dataset.episode_buffer or {}).get("size", 0)) - 1, 0)
++                if dataset is not None
++                else None,
++                phase="intervention_handover",
++                source="collector",
++                reason_code=reason,
++            )
++        logging.warning(
++            "%s Policy execution is stopped and both arms are holding position. "
++            "Support the leader with your hand, then press Enter to release leader torque "
++            "and begin teleoperation.",
++            reason,
++        )
++
+     if policy is None:
+         # During reset/teleop-only loops keep leader backdrivable for manual dragging.
+         set_teleop_manual_control(True)
++        describe_manual_reset_torque_mode = getattr(
++            robot, "describe_manual_reset_torque_mode", None
++        )
++        if callable(describe_manual_reset_torque_mode):
++            describe_manual_reset_torque_mode()
+ 
+     # Reset policy and processor if they are provided
+     if policy is not None and preprocessor is not None and postprocessor is not None:
+@@ -237,19 +284,128 @@ def record_loop(
+ 
+     timestamp = 0
+     start_episode_t = time.perf_counter()
+-    while timestamp < control_time_s:
++    # After an explicit policy-failure key, keep recording the human recovery
++    # even if the autonomous-policy time limit has elapsed. The episode ends on
++    # success or Esc, preserving the full failure-to-correction trajectory.
++    while (
++        control_time_s is None
++        or timestamp < control_time_s
++        or events.get("failure_recovery_active", False)
++    ):
+         start_loop_t = time.perf_counter()
++        frame_index = int((dataset.episode_buffer or {}).get("size", 0)) if dataset is not None else 0
++
++        if hil_recorder is not None:
++            hil_recorder.drain_keyboard_events(events, frame_index=frame_index)
+ 
+         if events["exit_early"]:
+             events["exit_early"] = False
+             break
+ 
++        if events.get("paused", False):
++            if hil_recorder is not None and not pause_was_active:
++                hil_recorder.finish_decision("pause")
++            pause_was_active = True
++            set_action_safety_tracking_enabled = getattr(
++                robot, "set_action_safety_tracking_enabled", None
++            )
++            if callable(set_action_safety_tracking_enabled):
++                set_action_safety_tracking_enabled(False)
++            precise_sleep(0.05)
++            timestamp = time.perf_counter() - start_episode_t
++            continue
++
++        if pause_was_active:
++            pause_was_active = False
++            if policy is not None and preprocessor is not None and postprocessor is not None:
++                policy.reset()
++                preprocessor.reset()
++                postprocessor.reset()
++                if acp_inference.enable and acp_inference.use_cfg:
++                    cond_policy_runtime_state = _capture_policy_runtime_state(policy)
++                    uncond_policy_runtime_state = _capture_policy_runtime_state(policy)
++                logging.info("Execution resumed: policy cache cleared for fresh-observation replanning.")
++            reset_action_safety_state = getattr(robot, "reset_action_safety_state", None)
++            if callable(reset_action_safety_state):
++                reset_action_safety_state()
++
++        if events.get("intervention_handover_pending", False):
++            if not events.get("confirm_intervention", False):
++                set_action_safety_tracking_enabled = getattr(
++                    robot, "set_action_safety_tracking_enabled", None
++                )
++                if callable(set_action_safety_tracking_enabled):
++                    set_action_safety_tracking_enabled(False)
++                precise_sleep(0.05)
++                timestamp = time.perf_counter() - start_episode_t
++                continue
++
++            events["confirm_intervention"] = False
++            events["intervention_handover_pending"] = False
++            set_teleop_manual_control(True)
++            intervention_state = INTERVENTION_STATE_ACTIVE
++            events["phase"] = "recording"
++            if hil_recorder is not None:
++                hil_recorder.record_event(
++                    "hold_end",
++                    frame_index=frame_index,
++                    phase="intervention_handover",
++                    source="collector",
++                )
++                hil_recorder.record_event(
++                    "human_takeover_start",
++                    frame_index=frame_index,
++                    phase="recording",
++                    source="human",
++                    reason_code=str(events.get("intervention_kind") or "recovery"),
++                )
++            reset_action_safety_state = getattr(robot, "reset_action_safety_state", None)
++            if callable(reset_action_safety_state):
++                reset_action_safety_state()
++            logging.info(
++                "Safe handover confirmed: leader torque is OFF and human teleoperation is active. "
++                "Complete the task, then press the success key."
++            )
++
++        if policy is None and events.get("confirm_reset", False):
++            events["confirm_reset"] = False
++            events["episode_start_authorized"] = True
++            logging.info("RESET confirmed by Enter; starting the next episode.")
++            break
++
++        if events.get("enter_intervention", False):
++            events["enter_intervention"] = False
++            if intervention_enabled:
++                intervention_kind = str(events.get("intervention_kind") or "recovery")
++                request_safe_intervention_handover(
++                    (
++                        "Likely-failure precursor marked."
++                        if intervention_kind == "preventive"
++                        else "Autonomous policy failure marked."
++                    ),
++                    intervention_kind=intervention_kind,
++                )
++                precise_sleep(0.05)
++                timestamp = time.perf_counter() - start_episode_t
++                continue
++            else:
++                logging.warning(
++                    "Requested failure recovery, but policy+teleop intervention is unavailable."
++                )
++
+         if events.get("toggle_intervention", False):
+             events["toggle_intervention"] = False
+-            if intervention_enabled:
++            if not manual_intervention_toggle_enabled:
++                logging.info("Manual intervention toggle ignored; use the episode failure key.")
++            elif events.get("failure_recovery_active", False):
++                logging.info(
++                    "Intervention toggle ignored during failure recovery; finish the task and press success."
++                )
++            elif intervention_enabled:
+                 if intervention_state == INTERVENTION_STATE_POLICY:
+                     set_teleop_manual_control(True)
+                     intervention_state = INTERVENTION_STATE_ACTIVE
++                    events["episode_had_intervention"] = True
+                     logging.info("Intervention enabled (S1): teleop actions now override policy execution.")
+                 else:
+                     set_teleop_manual_control(False)
+@@ -268,7 +424,14 @@ def record_loop(
+                 logging.info("Intervention toggle ignored because policy+teleop are not both active.")
+ 
+         # Get robot observation
++        observation_start_mono_ns = time.monotonic_ns()
+         obs = robot.get_observation()
++        observation_end_mono_ns = time.monotonic_ns()
++        camera_timestamps_ns: dict[str, int] = {}
++        for camera_key, camera in getattr(robot, "cameras", {}).items():
++            latest_timestamp = getattr(camera, "latest_timestamp", None)
++            if latest_timestamp is not None:
++                camera_timestamps_ns[camera_key] = int(float(latest_timestamp) * 1_000_000_000)
+ 
+         # Applies a pipeline to the raw robot observation, default is IdentityProcessor
+         obs_processed = robot_observation_processor(obs)
+@@ -300,6 +463,26 @@ def record_loop(
+             )
+             act_processed_policy = make_robot_action(policy_action, dataset.features)
+ 
++            if hil_recorder is not None:
++                capture = getattr(policy, "_hil_last_chunk_capture", None)
++                if capture is not None and capture.get("serial") != hil_recorder._last_chunk_serial:
++                    clipped_chunk = capture["clipped"]
++                    denormalized_chunk = postprocessor(clipped_chunk.clone())
++                    if hasattr(denormalized_chunk, "detach"):
++                        denormalized_chunk = denormalized_chunk.detach().cpu().numpy()
++                    hil_recorder.start_decision(
++                        chunk_serial=capture["serial"],
++                        source_frame_index=frame_index,
++                        source_observation_t_mono_ns=observation_end_mono_ns,
++                        inference_start_ns=capture["inference_start_ns"],
++                        inference_end_ns=capture["inference_end_ns"],
++                        raw_normalized_chunk=capture["raw"].squeeze(0).tolist(),
++                        clipped_normalized_chunk=clipped_chunk.squeeze(0).tolist(),
++                        denormalized_chunk=np.asarray(denormalized_chunk).squeeze(0).tolist(),
++                        planned_execution_steps=int(policy.config.n_action_steps),
++                        task_text=single_task,
++                    )
++
+         if isinstance(teleop, Teleoperator):
+             act = run_with_connection_retry("teleop.get_action", teleop.get_action)
+ 
+@@ -359,30 +542,179 @@ def record_loop(
+         else:
+             action_values = act_processed_policy if act_processed_policy is not None else act_processed_teleop
+ 
++        # Outcome/failure keys can arrive while policy inference is running.
++        # Never dispatch a just-computed action after the operator has ended
++        # the episode or requested the powered-leader handover.
++        if events.get("exit_early", False) or events.get("stop_recording", False):
++            timestamp = time.perf_counter() - start_episode_t
++            continue
++
++        if events.get("enter_intervention", False) or events.get(
++            "intervention_handover_pending", False
++        ):
++            precise_sleep(0.01)
++            timestamp = time.perf_counter() - start_episode_t
++            continue
++
++        # Space may be pressed while a comparatively slow policy inference is
++        # running. Re-check immediately before action processing/sending so the
++        # newly computed command is not dispatched after pause was requested.
++        if events.get("paused", False):
++            precise_sleep(0.05)
++            timestamp = time.perf_counter() - start_episode_t
++            continue
++
+         # Applies a pipeline to the action, default is IdentityProcessor
+         robot_action_to_send = robot_action_processor((action_values, obs))
++        selected_from_policy = act_processed_policy is not None and action_values is act_processed_policy
++        policy_physical_action = dict(robot_action_to_send) if selected_from_policy else None
++
++        # A real-robot wrapper may expose a policy-only safety hook. It validates
++        # the newly sampled chunk before either follower or leader is commanded,
++        # and may also apply distance-aware per-step limiting.
++        if selected_from_policy and hasattr(robot, "prepare_policy_action"):
++            try:
++                robot_action_to_send = robot.prepare_policy_action(robot_action_to_send)
++            except RuntimeError as error:
++                if not getattr(error, "replan_policy", False):
++                    raise
++                consecutive_policy_rejections += 1
++                if hil_recorder is not None:
++                    hil_recorder.record_safety_event(
++                        "proposal_rejected_before_send",
++                        frame_index=frame_index,
++                        reason=str(error),
++                        policy_action=policy_physical_action,
++                    )
++                    hil_recorder.finish_decision("safety_reject", status="rejected_before_execution")
++                logging.warning(
++                    "Rejected unsafe policy chunk (%d/%d): %s. Discarding it and replanning from a fresh observation.",
++                    consecutive_policy_rejections,
++                    max_policy_rejections,
++                    error,
++                )
++                policy.reset()
++                preprocessor.reset()
++                postprocessor.reset()
++                if acp_inference.enable and acp_inference.use_cfg:
++                    cond_policy_runtime_state = _capture_policy_runtime_state(policy)
++                    uncond_policy_runtime_state = _capture_policy_runtime_state(policy)
++                if consecutive_policy_rejections >= max_policy_rejections:
++                    if intervention_enabled:
++                        request_safe_intervention_handover(
++                            "Three consecutive unsafe policy chunks were rejected."
++                        )
++                        consecutive_policy_rejections = 0
++                    else:
++                        raise RuntimeError(
++                            "Three consecutive unsafe policy chunks and no teleoperator is available."
++                        ) from error
++                precise_sleep(max(1 / fps - (time.perf_counter() - start_loop_t), 0.0))
++                timestamp = time.perf_counter() - start_episode_t
++                continue
+ 
+         # Send action to robot
+         # Action can eventually be clipped using `max_relative_target`,
+         # so action actually sent is saved in the dataset. action = postprocessor.process(action)
+         # TODO(steven, pepijn, adil): we should use a pipeline step to clip the action, so the sent action is the action that we input to the robot.
+-        selected_from_policy = act_processed_policy is not None and action_values is act_processed_policy
+-        if policy_sync_executor is not None and selected_from_policy:
+-            _sent_action = run_with_connection_retry(
+-                "policy_sync_executor.send_action",
+-                lambda robot_action_to_send=robot_action_to_send: policy_sync_executor.send_action(
+-                    robot_action_to_send
+-                ),
++        set_action_safety_tracking_enabled = getattr(
++            robot, "set_action_safety_tracking_enabled", None
++        )
++        if callable(set_action_safety_tracking_enabled):
++            set_action_safety_tracking_enabled(selected_from_policy)
++        safety_limited_action = dict(robot_action_to_send)
++        action_send_start_mono_ns = time.monotonic_ns()
++        try:
++            if policy_sync_executor is not None and selected_from_policy:
++                _sent_action = run_with_connection_retry(
++                    "policy_sync_executor.send_action",
++                    lambda robot_action_to_send=robot_action_to_send: policy_sync_executor.send_action(
++                        robot_action_to_send
++                    ),
++                )
++            else:
++                _sent_action = run_with_connection_retry(
++                    "robot.send_action",
++                    lambda robot_action_to_send=robot_action_to_send: robot.send_action(
++                        robot_action_to_send
++                    ),
++                )
++        except RuntimeError as error:
++            if not (selected_from_policy and getattr(error, "replan_policy", False)):
++                raise
++            consecutive_policy_rejections += 1
++            if hil_recorder is not None:
++                hil_recorder.record_safety_event(
++                    "execution_aborted_after_send",
++                    frame_index=frame_index,
++                    reason=str(error),
++                    policy_action=policy_physical_action,
++                    safety_action=safety_limited_action,
++                )
++                hil_recorder.finish_decision("tracking_failure", status="aborted_after_execution_started")
++            logging.warning(
++                "Rejected policy chunk during execution (%d/%d): %s. "
++                "Discarding it and replanning from a fresh observation.",
++                consecutive_policy_rejections,
++                max_policy_rejections,
++                error,
+             )
+-        else:
+-            _sent_action = run_with_connection_retry(
+-                "robot.send_action",
+-                lambda robot_action_to_send=robot_action_to_send: robot.send_action(robot_action_to_send),
++            policy.reset()
++            preprocessor.reset()
++            postprocessor.reset()
++            reset_action_safety_state = getattr(robot, "reset_action_safety_state", None)
++            if callable(reset_action_safety_state):
++                reset_action_safety_state()
++            if acp_inference.enable and acp_inference.use_cfg:
++                cond_policy_runtime_state = _capture_policy_runtime_state(policy)
++                uncond_policy_runtime_state = _capture_policy_runtime_state(policy)
++            if consecutive_policy_rejections >= max_policy_rejections:
++                if intervention_enabled:
++                    request_safe_intervention_handover(
++                        "Three consecutive policy execution safety rejections occurred."
++                    )
++                    consecutive_policy_rejections = 0
++                else:
++                    raise RuntimeError(
++                        "Three consecutive policy execution safety rejections and "
++                        "no teleoperator is available."
++                    ) from error
++            precise_sleep(max(1 / fps - (time.perf_counter() - start_loop_t), 0.0))
++            timestamp = time.perf_counter() - start_episode_t
++            continue
++        action_send_end_mono_ns = time.monotonic_ns()
++        if selected_from_policy:
++            consecutive_policy_rejections = 0
++
++        decision_id = hil_recorder.current_decision_id if hil_recorder is not None else None
++        decision_step = (
++            hil_recorder.mark_decision_step_executed()
++            if hil_recorder is not None and selected_from_policy and decision_id is not None
++            else -1
++        )
++        safety_modified = False
++        if policy_physical_action is not None:
++            safety_modified = any(
++                abs(float(policy_physical_action[name]) - float(safety_limited_action[name])) > 1e-6
++                for name in action_feature_names
++                if name in policy_physical_action and name in safety_limited_action
+             )
++            if safety_modified and hil_recorder is not None:
++                hil_recorder.record_safety_event(
++                    "safety_clip",
++                    frame_index=frame_index,
++                    reason="per_step_or_soft_limit",
++                    policy_action=policy_physical_action,
++                    safety_action=safety_limited_action,
++                    decision_step=decision_step,
++                )
+ 
+         # Write to dataset
+         if dataset is not None:
+-            action_frame = build_dataset_frame(dataset.features, action_values, prefix=ACTION)
++            # Store the action actually accepted/sent by the robot safety layer.
++            # The unmodified policy proposal remains available in
++            # complementary_info.policy_action for intervention research.
++            action_frame = build_dataset_frame(dataset.features, _sent_action, prefix=ACTION)
+             policy_action_frame = build_dataset_frame(
+                 dataset.features, policy_action_for_storage, prefix="complementary_info.policy_action"
+             )
+@@ -400,6 +732,91 @@ def record_loop(
+                     policy_id=collector_policy_id_policy,
+                     human_id=collector_policy_id_human,
+                 )
++            if hil_recorder is not None and "hil.t_mono_ns" in dataset.features:
++                control_source = (
++                    (
++                        "human_preventive"
++                        if events.get("intervention_kind") == "preventive"
++                        else "human_recovery"
++                    )
++                    if bool(is_intervention)
++                    else "policy"
++                )
++                zero_vector = np.zeros(len(action_feature_names), dtype=np.float32)
++                policy_vector = (
++                    np.asarray(
++                        [float(policy_physical_action[name]) for name in action_feature_names],
++                        dtype=np.float32,
++                    )
++                    if policy_physical_action is not None
++                    else zero_vector
++                )
++                safety_vector = np.asarray(
++                    [float(safety_limited_action[name]) for name in action_feature_names], dtype=np.float32
++                )
++                frame.update(
++                    {
++                        "hil.t_mono_ns": np.array([observation_end_mono_ns], dtype=np.int64),
++                        "hil.observation_start_mono_ns": np.array(
++                            [observation_start_mono_ns], dtype=np.int64
++                        ),
++                        "hil.observation_end_mono_ns": np.array(
++                            [observation_end_mono_ns], dtype=np.int64
++                        ),
++                        "hil.base_camera_received_mono_ns": np.array(
++                            [camera_timestamps_ns.get("base_0_rgb", -1)], dtype=np.int64
++                        ),
++                        "hil.wrist_camera_received_mono_ns": np.array(
++                            [camera_timestamps_ns.get("left_wrist_0_rgb", -1)], dtype=np.int64
++                        ),
++                        "hil.action_send_start_mono_ns": np.array(
++                            [action_send_start_mono_ns], dtype=np.int64
++                        ),
++                        "hil.action_send_end_mono_ns": np.array(
++                            [action_send_end_mono_ns], dtype=np.int64
++                        ),
++                        "hil.episode_uuid": hil_recorder.episode_uuid or "",
++                        "hil.decision_id": decision_id or "",
++                        "hil.decision_step": np.array([decision_step], dtype=np.int64),
++                        "hil.continuity_segment_id": np.array(
++                            [hil_recorder.continuity_segment_id], dtype=np.int64
++                        ),
++                        "hil.control_source": control_source,
++                        "hil.policy_action_valid": np.array(
++                            [1.0 if selected_from_policy else 0.0], dtype=np.float32
++                        ),
++                        "hil.policy_step_physical": policy_vector,
++                        "hil.safety_limited_action": safety_vector,
++                        "hil.safety_modified": np.array(
++                            [1.0 if safety_modified else 0.0], dtype=np.float32
++                        ),
++                    }
++                )
++                hil_recorder.record_frame_telemetry(
++                    frame_index=frame_index,
++                    t_mono_ns=observation_end_mono_ns,
++                    observation_start_mono_ns=observation_start_mono_ns,
++                    observation_end_mono_ns=observation_end_mono_ns,
++                    action_send_start_mono_ns=action_send_start_mono_ns,
++                    action_send_end_mono_ns=action_send_end_mono_ns,
++                    control_source=control_source,
++                    decision_id=decision_id,
++                    decision_step=decision_step,
++                    policy_action_valid=selected_from_policy,
++                    policy_step_physical=policy_physical_action,
++                    safety_limited_action=safety_limited_action,
++                    commanded_action=_sent_action,
++                    safety_modified=safety_modified,
++                    # Images remain canonical in LeRobot video files. The WAL
++                    # keeps only low-dimensional state/telemetry so it stays
++                    # cheap enough for the 30 Hz control path.
++                    observation={
++                        key: value
++                        for key, value in obs_processed.items()
++                        if "image" not in key.lower()
++                        and not (hasattr(value, "ndim") and int(value.ndim) >= 2)
++                    },
++                )
+             dataset.add_frame(frame)
+ 
+         if display_data:
+diff --git a/src/lerobot/utils/control_utils.py b/src/lerobot/utils/control_utils.py
+index a49863b..44c0071 100644
+--- a/src/lerobot/utils/control_utils.py
++++ b/src/lerobot/utils/control_utils.py
+@@ -46,6 +46,27 @@ from lerobot.utils.recording_annotations import EPISODE_FAILURE, EPISODE_SUCCESS
+ INTERVENTION_TOGGLE_COOLDOWN_S = 0.5
+ 
+ 
++def _key_matches(normalized_key: str, configured_key: str | None) -> bool:
++    if configured_key is None:
++        return False
++    normalized_key = normalized_key.lower()
++    configured_key = configured_key.lower()
++    return normalized_key == configured_key or (
++        normalized_key == " " and configured_key == "space"
++    )
++
++
++def _queue_hil_event(events: dict[str, Any], event_type: str, *, source: str = "human") -> None:
++    events.setdefault("hil_pending_events", []).append(
++        {
++            "event_type": event_type,
++            "occurred_mono_ns": time.monotonic_ns(),
++            "phase": events.get("phase"),
++            "source": source,
++        }
++    )
++
++
+ @cache
+ def is_headless():
+     """
+@@ -74,18 +95,33 @@ class TTYKeyboardListener:
+         self,
+         events: dict[str, Any],
+         intervention_toggle_key: str,
++        intervention_toggle_enabled: bool,
++        pause_toggle_key: str | None,
+         episode_success_key: str | None,
+         episode_failure_key: str | None,
++        episode_preventive_key: str | None = None,
++        episode_terminal_failure_key: str | None = None,
++        failure_enters_intervention: bool = False,
+     ):
+         self.events = events
+         self.intervention_toggle_key = intervention_toggle_key.lower()
++        self.intervention_toggle_enabled = intervention_toggle_enabled
++        self.pause_toggle_key = pause_toggle_key.lower() if pause_toggle_key else None
+         self.episode_success_key = episode_success_key.lower() if episode_success_key else None
+         self.episode_failure_key = episode_failure_key.lower() if episode_failure_key else None
++        self.episode_preventive_key = (
++            episode_preventive_key.lower() if episode_preventive_key else None
++        )
++        self.episode_terminal_failure_key = (
++            episode_terminal_failure_key.lower() if episode_terminal_failure_key else None
++        )
++        self.failure_enters_intervention = failure_enters_intervention
+         self._fd = sys.stdin.fileno()
+         self._stop_event = threading.Event()
+         self._thread: threading.Thread | None = None
+         self._old_attrs = None
+         self._last_intervention_time: float = 0.0
++        self._last_pause_time: float = 0.0
+ 
+     def start(self):
+         self._old_attrs = termios.tcgetattr(self._fd)
+@@ -139,6 +175,10 @@ class TTYKeyboardListener:
+                 return "RIGHT"
+             if sequence_bytes in {b"\x1b[D", b"\x1bOD"}:
+                 return "LEFT"
++            if sequence_bytes in {b"\x1b[B", b"\x1bOB"}:
++                return "DOWN"
++            if sequence_bytes in {b"\x1b[A", b"\x1bOA"}:
++                return "UP"
+             if sequence_bytes == b"\x1b":
+                 return "ESC"
+             return None
+@@ -150,32 +190,120 @@ class TTYKeyboardListener:
+ 
+     def _handle_key(self, key: str):
+         normalized = key.lower() if len(key) == 1 else key
+-        if normalized == "RIGHT":
++        arrow_is_outcome = _key_matches(normalized, self.episode_success_key) or _key_matches(
++            normalized, self.episode_failure_key
++        ) or _key_matches(normalized, self.episode_preventive_key) or _key_matches(
++            normalized, self.episode_terminal_failure_key
++        )
++        if normalized == "RIGHT" and not arrow_is_outcome:
+             print("Right arrow key pressed. Exiting loop...")
+             self.events["exit_early"] = True
+-        elif normalized == "LEFT":
++        elif normalized == "LEFT" and not arrow_is_outcome:
+             print("Left arrow key pressed. Exiting loop and rerecord the last episode...")
+             self.events["rerecord_episode"] = True
+             self.events["exit_early"] = True
+         elif normalized == "ESC":
++            _queue_hil_event(self.events, "session_stop")
+             print("Escape key pressed. Stopping data recording...")
+             self.events["stop_recording"] = True
+             self.events["exit_early"] = True
+-        elif normalized == self.intervention_toggle_key:
++        elif _key_matches(normalized, self.pause_toggle_key):
++            now = time.monotonic()
++            if now - self._last_pause_time < INTERVENTION_TOGGLE_COOLDOWN_S:
++                return
++            self._last_pause_time = now
++            self.events["paused"] = not self.events.get("paused", False)
++            _queue_hil_event(
++                self.events, "pause_start" if self.events["paused"] else "pause_end"
++            )
++            state = "PAUSED" if self.events["paused"] else "RESUMED"
++            print(f"Space key pressed. Execution {state}.")
++        elif self.events.get("paused", False):
++            print("Execution is paused; press Space to resume (Esc still stops recording).")
++        elif normalized in {"\r", "\n", "ENTER"}:
++            if self.events.get("phase") == "intervention_handover":
++                _queue_hil_event(self.events, "human_takeover_confirmed")
++                print("Enter key pressed. Confirming safe handover to teleoperation...")
++                self.events["confirm_intervention"] = True
++            elif self.events.get("phase") in {"waiting_start", "reset"}:
++                _queue_hil_event(
++                    self.events,
++                    "reset_complete"
++                    if self.events.get("phase") == "reset"
++                    else "episode_start_confirmed",
++                )
++                print("Enter key pressed. Confirming episode start/RESET completion...")
++                self.events["confirm_reset"] = True
++            else:
++                print("Enter ignored while an episode is being recorded.")
++        elif self.intervention_toggle_enabled and _key_matches(
++            normalized, self.intervention_toggle_key
++        ):
+             now = time.monotonic()
+             if now - self._last_intervention_time < INTERVENTION_TOGGLE_COOLDOWN_S:
+                 return
+             self._last_intervention_time = now
+             print(f"'{self.intervention_toggle_key}' key pressed. Toggling intervention mode...")
+             self.events["toggle_intervention"] = True
+-        elif self.episode_success_key and normalized == self.episode_success_key:
+-            print(f"'{self.episode_success_key}' key pressed. Marking episode as success and exiting loop...")
+-            self.events["episode_outcome"] = EPISODE_SUCCESS
+-            self.events["exit_early"] = True
+-        elif self.episode_failure_key and normalized == self.episode_failure_key:
+-            print(f"'{self.episode_failure_key}' key pressed. Marking episode as failure and exiting loop...")
+-            self.events["episode_outcome"] = EPISODE_FAILURE
+-            self.events["exit_early"] = True
++        elif _key_matches(normalized, self.episode_success_key):
++            if self.events.get("phase") != "recording":
++                print(f"'{self.episode_success_key}' ignored outside RECORDING.")
++            else:
++                if self.events.get("failure_recovery_active", False):
++                    _queue_hil_event(self.events, "human_takeover_end")
++                    _queue_hil_event(
++                        self.events,
++                        "preventive_complete"
++                        if self.events.get("intervention_kind") == "preventive"
++                        else "recovery_complete",
++                    )
++                _queue_hil_event(self.events, "task_success")
++                print(f"'{self.episode_success_key}' key pressed. Marking episode as success and exiting loop...")
++                self.events["episode_outcome"] = EPISODE_SUCCESS
++                self.events["exit_early"] = True
++        elif _key_matches(normalized, self.episode_failure_key):
++            if self.events.get("phase") != "recording":
++                print(f"'{self.episode_failure_key}' ignored outside RECORDING.")
++            elif self.failure_enters_intervention:
++                _queue_hil_event(self.events, "failure_notice")
++                print(
++                    f"'{self.episode_failure_key}' key pressed. Marking autonomous policy failure "
++                    "and entering human intervention..."
++                )
++                self.events["policy_failure_detected"] = True
++                self.events["intervention_kind"] = "recovery"
++                self.events["failure_recovery_active"] = True
++                self.events["enter_intervention"] = True
++            else:
++                print(f"'{self.episode_failure_key}' key pressed. Marking episode as failure and exiting loop...")
++                self.events["episode_outcome"] = EPISODE_FAILURE
++                self.events["exit_early"] = True
++        elif _key_matches(normalized, self.episode_preventive_key):
++            if self.events.get("phase") != "recording":
++                print(f"'{self.episode_preventive_key}' ignored outside RECORDING.")
++            elif not self.failure_enters_intervention:
++                print("Preventive intervention is unavailable without the HIL state machine.")
++            else:
++                _queue_hil_event(self.events, "preventive_notice")
++                print(
++                    f"'{self.episode_preventive_key}' key pressed. Marking a likely-failure precursor "
++                    "and entering preventive human intervention..."
++                )
++                self.events["preventive_intervention_detected"] = True
++                self.events["intervention_kind"] = "preventive"
++                self.events["failure_recovery_active"] = True
++                self.events["enter_intervention"] = True
++        elif _key_matches(normalized, self.episode_terminal_failure_key):
++            if self.events.get("phase") != "recording":
++                print(f"'{self.episode_terminal_failure_key}' ignored outside RECORDING.")
++            elif not self.events.get("failure_recovery_active", False):
++                print("Terminal-failure key ignored before a recovery has started; use the failure key first.")
++            else:
++                _queue_hil_event(self.events, "human_takeover_end")
++                _queue_hil_event(self.events, "terminal_failure")
++                print("Recovery marked as terminal failure; ending only the current episode...")
++                self.events["episode_outcome"] = EPISODE_FAILURE
++                self.events["exit_early"] = True
+ 
+ 
+ def predict_action(
+@@ -231,8 +359,13 @@ def predict_action(
+ 
+ def init_keyboard_listener(
+     intervention_toggle_key: str = "i",
++    intervention_toggle_enabled: bool = True,
++    pause_toggle_key: str | None = None,
+     episode_success_key: str | None = None,
+     episode_failure_key: str | None = None,
++    episode_preventive_key: str | None = None,
++    failure_enters_intervention: bool = False,
++    episode_terminal_failure_key: str | None = None,
+ ):
+     """
+     Initializes a non-blocking keyboard listener for real-time user interaction.
+@@ -256,17 +389,110 @@ def init_keyboard_listener(
+     events["stop_recording"] = False
+     events["toggle_intervention"] = False
+     events["episode_outcome"] = None
++    events["enter_intervention"] = False
++    events["failure_recovery_active"] = False
++    events["policy_failure_detected"] = False
++    events["preventive_intervention_detected"] = False
++    events["intervention_kind"] = None
++    events["episode_had_intervention"] = False
++    events["confirm_intervention"] = False
++    events["intervention_handover_pending"] = False
++    events["confirm_reset"] = False
++    events["episode_start_authorized"] = False
++    events["paused"] = False
++    events["phase"] = "waiting_start"
++    events["hil_pending_events"] = []
+ 
+     listener = None
+-    if not is_headless():
++    keyboard_mode = os.environ.get("LEROBOT_KEYBOARD_MODE", "auto").strip().lower()
++    if keyboard_mode not in {"auto", "tty"}:
++        raise ValueError("LEROBOT_KEYBOARD_MODE must be either 'auto' or 'tty'.")
++    use_tty_keyboard = keyboard_mode == "tty" or is_headless()
++
++    if not use_tty_keyboard:
+         # Only import pynput if not in a headless environment
+         from pynput import keyboard
+ 
+         last_intervention_time = [0.0]
++        last_pause_time = [0.0]
+ 
+         def on_press(key):
+             try:
++                special_key = None
+                 if key == keyboard.Key.right:
++                    special_key = "RIGHT"
++                elif key == keyboard.Key.left:
++                    special_key = "LEFT"
++                elif key == keyboard.Key.down:
++                    special_key = "DOWN"
++                elif key == keyboard.Key.up:
++                    special_key = "UP"
++
++                if special_key and _key_matches(special_key, episode_terminal_failure_key):
++                    if events.get("phase") != "recording":
++                        print(f"'{episode_terminal_failure_key}' ignored outside RECORDING.")
++                    elif not events.get("failure_recovery_active", False):
++                        print("Terminal-failure key ignored before a recovery has started.")
++                    else:
++                        _queue_hil_event(events, "human_takeover_end")
++                        _queue_hil_event(events, "terminal_failure")
++                        events["episode_outcome"] = EPISODE_FAILURE
++                        events["exit_early"] = True
++                elif special_key and _key_matches(special_key, episode_success_key):
++                    if events.get("phase") != "recording":
++                        print(f"'{episode_success_key}' ignored outside RECORDING.")
++                    else:
++                        if events.get("failure_recovery_active", False):
++                            _queue_hil_event(events, "human_takeover_end")
++                            _queue_hil_event(
++                                events,
++                                "preventive_complete"
++                                if events.get("intervention_kind") == "preventive"
++                                else "recovery_complete",
++                            )
++                        _queue_hil_event(events, "task_success")
++                        print(
++                            f"'{episode_success_key}' key pressed. "
++                            "Marking episode as success and exiting loop..."
++                        )
++                        events["episode_outcome"] = EPISODE_SUCCESS
++                        events["exit_early"] = True
++                elif special_key and _key_matches(special_key, episode_preventive_key):
++                    if events.get("phase") != "recording":
++                        print(f"'{episode_preventive_key}' ignored outside RECORDING.")
++                    elif not failure_enters_intervention:
++                        print("Preventive intervention is unavailable without the HIL state machine.")
++                    else:
++                        _queue_hil_event(events, "preventive_notice")
++                        print(
++                            f"'{episode_preventive_key}' key pressed. Marking a likely-failure "
++                            "precursor and entering preventive human intervention..."
++                        )
++                        events["preventive_intervention_detected"] = True
++                        events["intervention_kind"] = "preventive"
++                        events["failure_recovery_active"] = True
++                        events["enter_intervention"] = True
++                elif special_key and _key_matches(special_key, episode_failure_key):
++                    if events.get("phase") != "recording":
++                        print(f"'{episode_failure_key}' ignored outside RECORDING.")
++                    elif failure_enters_intervention:
++                        _queue_hil_event(events, "failure_notice")
++                        print(
++                            f"'{episode_failure_key}' key pressed. Marking autonomous policy failure "
++                            "and entering human intervention..."
++                        )
++                        events["policy_failure_detected"] = True
++                        events["intervention_kind"] = "recovery"
++                        events["failure_recovery_active"] = True
++                        events["enter_intervention"] = True
++                    else:
++                        print(
++                            f"'{episode_failure_key}' key pressed. "
++                            "Marking episode as failure and exiting loop..."
++                        )
++                        events["episode_outcome"] = EPISODE_FAILURE
++                        events["exit_early"] = True
++                elif key == keyboard.Key.right:
+                     print("Right arrow key pressed. Exiting loop...")
+                     events["exit_early"] = True
+                 elif key == keyboard.Key.left:
+@@ -274,10 +500,78 @@ def init_keyboard_listener(
+                     events["rerecord_episode"] = True
+                     events["exit_early"] = True
+                 elif key == keyboard.Key.esc:
++                    _queue_hil_event(events, "session_stop")
+                     print("Escape key pressed. Stopping data recording...")
+                     events["stop_recording"] = True
+                     events["exit_early"] = True
+-                elif hasattr(key, "char") and key.char and key.char.lower() == intervention_toggle_key.lower():
++                elif key == keyboard.Key.space and pause_toggle_key == "space":
++                    now = time.monotonic()
++                    if now - last_pause_time[0] < INTERVENTION_TOGGLE_COOLDOWN_S:
++                        return
++                    last_pause_time[0] = now
++                    events["paused"] = not events.get("paused", False)
++                    _queue_hil_event(events, "pause_start" if events["paused"] else "pause_end")
++                    state = "PAUSED" if events["paused"] else "RESUMED"
++                    print(f"Space key pressed. Execution {state}.")
++                elif (
++                    pause_toggle_key
++                    and pause_toggle_key != "space"
++                    and hasattr(key, "char")
++                    and key.char
++                    and key.char.lower() == pause_toggle_key.lower()
++                ):
++                    now = time.monotonic()
++                    if now - last_pause_time[0] < INTERVENTION_TOGGLE_COOLDOWN_S:
++                        return
++                    last_pause_time[0] = now
++                    events["paused"] = not events.get("paused", False)
++                    _queue_hil_event(events, "pause_start" if events["paused"] else "pause_end")
++                    state = "PAUSED" if events["paused"] else "RESUMED"
++                    print(f"'{pause_toggle_key}' key pressed. Execution {state}.")
++                elif events.get("paused", False):
++                    print("Execution is paused; press Space to resume (Esc still stops recording).")
++                elif key == keyboard.Key.enter:
++                    if events.get("phase") == "intervention_handover":
++                        _queue_hil_event(events, "human_takeover_confirmed")
++                        print("Enter key pressed. Confirming safe handover to teleoperation...")
++                        events["confirm_intervention"] = True
++                    elif events.get("phase") in {"waiting_start", "reset"}:
++                        _queue_hil_event(
++                            events,
++                            "reset_complete"
++                            if events.get("phase") == "reset"
++                            else "episode_start_confirmed",
++                        )
++                        print("Enter key pressed. Confirming episode start/RESET completion...")
++                        events["confirm_reset"] = True
++                    else:
++                        if events.get("failure_recovery_active", False):
++                            _queue_hil_event(events, "human_takeover_end")
++                            _queue_hil_event(
++                                events,
++                                "preventive_complete"
++                                if events.get("intervention_kind") == "preventive"
++                                else "recovery_complete",
++                            )
++                        _queue_hil_event(events, "task_success")
++                        print("Enter ignored while an episode is being recorded.")
++                elif (
++                    intervention_toggle_enabled
++                    and key == keyboard.Key.space
++                    and intervention_toggle_key.lower() == "space"
++                ):
++                    now = time.monotonic()
++                    if now - last_intervention_time[0] < INTERVENTION_TOGGLE_COOLDOWN_S:
++                        return
++                    last_intervention_time[0] = now
++                    print("Space key pressed. Toggling intervention mode...")
++                    events["toggle_intervention"] = True
++                elif (
++                    intervention_toggle_enabled
++                    and hasattr(key, "char")
++                    and key.char
++                    and key.char.lower() == intervention_toggle_key.lower()
++                ):
+                     now = time.monotonic()
+                     if now - last_intervention_time[0] < INTERVENTION_TOGGLE_COOLDOWN_S:
+                         return
+@@ -290,18 +584,74 @@ def init_keyboard_listener(
+                     and key.char
+                     and key.char.lower() == episode_success_key.lower()
+                 ):
+-                    print(f"'{episode_success_key}' key pressed. Marking episode as success and exiting loop...")
+-                    events["episode_outcome"] = EPISODE_SUCCESS
+-                    events["exit_early"] = True
++                    if events.get("phase") != "recording":
++                        print(f"'{episode_success_key}' ignored outside RECORDING.")
++                    else:
++                        if events.get("failure_recovery_active", False):
++                            _queue_hil_event(events, "human_takeover_end")
++                            _queue_hil_event(
++                                events,
++                                "preventive_complete"
++                                if events.get("intervention_kind") == "preventive"
++                                else "recovery_complete",
++                            )
++                        _queue_hil_event(events, "task_success")
++                        print(f"'{episode_success_key}' key pressed. Marking episode as success and exiting loop...")
++                        events["episode_outcome"] = EPISODE_SUCCESS
++                        events["exit_early"] = True
++                elif (
++                    episode_preventive_key
++                    and hasattr(key, "char")
++                    and key.char
++                    and key.char.lower() == episode_preventive_key.lower()
++                ):
++                    if events.get("phase") != "recording":
++                        print(f"'{episode_preventive_key}' ignored outside RECORDING.")
++                    elif not failure_enters_intervention:
++                        print("Preventive intervention is unavailable without the HIL state machine.")
++                    else:
++                        _queue_hil_event(events, "preventive_notice")
++                        events["preventive_intervention_detected"] = True
++                        events["intervention_kind"] = "preventive"
++                        events["failure_recovery_active"] = True
++                        events["enter_intervention"] = True
+                 elif (
+                     episode_failure_key
+                     and hasattr(key, "char")
+                     and key.char
+                     and key.char.lower() == episode_failure_key.lower()
+                 ):
+-                    print(f"'{episode_failure_key}' key pressed. Marking episode as failure and exiting loop...")
+-                    events["episode_outcome"] = EPISODE_FAILURE
+-                    events["exit_early"] = True
++                    if events.get("phase") != "recording":
++                        print(f"'{episode_failure_key}' ignored outside RECORDING.")
++                    elif failure_enters_intervention:
++                        _queue_hil_event(events, "failure_notice")
++                        print(
++                            f"'{episode_failure_key}' key pressed. Marking autonomous policy failure "
++                            "and entering human intervention..."
++                        )
++                        events["policy_failure_detected"] = True
++                        events["intervention_kind"] = "recovery"
++                        events["failure_recovery_active"] = True
++                        events["enter_intervention"] = True
++                    else:
++                        print(f"'{episode_failure_key}' key pressed. Marking episode as failure and exiting loop...")
++                        events["episode_outcome"] = EPISODE_FAILURE
++                        events["exit_early"] = True
++                elif (
++                    episode_terminal_failure_key
++                    and hasattr(key, "char")
++                    and key.char
++                    and key.char.lower() == episode_terminal_failure_key.lower()
++                ):
++                    if events.get("phase") != "recording":
++                        print(f"'{episode_terminal_failure_key}' ignored outside RECORDING.")
++                    elif not events.get("failure_recovery_active", False):
++                        print("Terminal-failure key ignored before a recovery has started.")
++                    else:
++                        _queue_hil_event(events, "human_takeover_end")
++                        _queue_hil_event(events, "terminal_failure")
++                        events["episode_outcome"] = EPISODE_FAILURE
++                        events["exit_early"] = True
+             except Exception as e:
+                 print(f"Error handling key press: {e}")
+ 
+@@ -313,13 +663,23 @@ def init_keyboard_listener(
+         listener = TTYKeyboardListener(
+             events=events,
+             intervention_toggle_key=intervention_toggle_key,
++            intervention_toggle_enabled=intervention_toggle_enabled,
++            pause_toggle_key=pause_toggle_key,
+             episode_success_key=episode_success_key,
+             episode_failure_key=episode_failure_key,
++            episode_preventive_key=episode_preventive_key,
++            episode_terminal_failure_key=episode_terminal_failure_key,
++            failure_enters_intervention=failure_enters_intervention,
+         )
+         listener.start()
+-        logging.warning(
+-            "Headless environment detected. Using terminal keyboard controls over the current TTY; on-screen camera display remains unavailable."
+-        )
++        if keyboard_mode == "tty":
++            logging.info(
++                "Terminal-only keyboard mode enabled. Control keys are accepted only while this terminal has input focus."
++            )
++        else:
++            logging.warning(
++                "Headless environment detected. Using terminal keyboard controls over the current TTY; on-screen camera display remains unavailable."
++            )
+         return listener, events
+ 
+     logging.warning(
+diff --git a/tests/utils/test_control_utils.py b/tests/utils/test_control_utils.py
+index bbf3b14..829dffc 100644
+--- a/tests/utils/test_control_utils.py
++++ b/tests/utils/test_control_utils.py
+@@ -2,7 +2,7 @@ from types import SimpleNamespace
+ 
+ import pytest
+ 
+-from lerobot.utils.control_utils import sanity_check_bimanual_piper_pair
++from lerobot.utils.control_utils import TTYKeyboardListener, sanity_check_bimanual_piper_pair
+ 
+ 
+ @pytest.mark.parametrize(
+@@ -39,3 +39,214 @@ def test_sanity_check_bimanual_piper_pair_rejects_mixed_pairs(robot_type, teleop
+             SimpleNamespace(type=robot_type),
+             SimpleNamespace(type=teleop_type),
+         )
++
++
++def _make_tty_listener_for_key_test(*, failure_enters_intervention: bool):
++    events = {
++        "exit_early": False,
++        "rerecord_episode": False,
++        "episode_outcome": None,
++        "policy_failure_detected": False,
++        "preventive_intervention_detected": False,
++        "intervention_kind": None,
++        "failure_recovery_active": False,
++        "enter_intervention": False,
++        "confirm_intervention": False,
++        "intervention_handover_pending": False,
++        "confirm_reset": False,
++        "phase": "recording",
++    }
++    listener = object.__new__(TTYKeyboardListener)
++    listener.events = events
++    listener.intervention_toggle_key = "space"
++    listener.intervention_toggle_enabled = True
++    listener.pause_toggle_key = None
++    listener.episode_success_key = "s"
++    listener.episode_failure_key = "f"
++    listener.episode_preventive_key = None
++    listener.episode_terminal_failure_key = None
++    listener.failure_enters_intervention = failure_enters_intervention
++    listener._last_intervention_time = 0.0
++    listener._last_pause_time = 0.0
++    return listener, events
++
++
++def test_failure_key_enters_intervention_without_ending_episode():
++    listener, events = _make_tty_listener_for_key_test(failure_enters_intervention=True)
++
++    listener._handle_key("f")
++
++    assert events["policy_failure_detected"] is True
++    assert events["failure_recovery_active"] is True
++    assert events["enter_intervention"] is True
++    assert events["episode_outcome"] is None
++    assert events["exit_early"] is False
++
++
++def test_success_after_failure_recovery_ends_episode_as_success():
++    listener, events = _make_tty_listener_for_key_test(failure_enters_intervention=True)
++    listener._handle_key("f")
++
++    listener._handle_key("s")
++
++    assert events["episode_outcome"] == "success"
++    assert events["exit_early"] is True
++
++
++def test_enter_sets_independent_reset_confirmation_event():
++    listener, events = _make_tty_listener_for_key_test(failure_enters_intervention=True)
++    events["phase"] = "reset"
++
++    listener._handle_key("\r")
++
++    assert events["confirm_reset"] is True
++    assert events["exit_early"] is False
++
++
++def test_enter_confirms_intervention_handover_without_confirming_reset():
++    listener, events = _make_tty_listener_for_key_test(failure_enters_intervention=True)
++    events["phase"] = "intervention_handover"
++
++    listener._handle_key("\r")
++
++    assert events["confirm_intervention"] is True
++    assert events["confirm_reset"] is False
++    assert events["exit_early"] is False
++
++
++def test_outcome_keys_are_ignored_during_intervention_handover():
++    listener, events = _make_tty_listener_for_key_test(failure_enters_intervention=True)
++    events["phase"] = "intervention_handover"
++
++    listener._handle_key("s")
++    listener._handle_key("f")
++
++    assert events["episode_outcome"] is None
++    assert events["policy_failure_detected"] is False
++    assert events["exit_early"] is False
++
++
++def test_space_pauses_and_resumes_execution():
++    listener, events = _make_tty_listener_for_key_test(failure_enters_intervention=True)
++    listener.pause_toggle_key = "space"
++
++    listener._handle_key(" ")
++    assert events["paused"] is True
++
++    listener._last_pause_time = 0.0
++    listener._handle_key(" ")
++    assert events["paused"] is False
++
++
++def test_outcome_keys_are_ignored_while_paused():
++    listener, events = _make_tty_listener_for_key_test(failure_enters_intervention=True)
++    listener.pause_toggle_key = "space"
++    events["paused"] = True
++
++    listener._handle_key("s")
++    listener._handle_key("f")
++
++    assert events["episode_outcome"] is None
++    assert events["policy_failure_detected"] is False
++    assert events["exit_early"] is False
++
++
++def test_outcome_keys_are_ignored_during_reset():
++    listener, events = _make_tty_listener_for_key_test(failure_enters_intervention=True)
++    events["phase"] = "reset"
++
++    listener._handle_key("s")
++    listener._handle_key("f")
++
++    assert events["episode_outcome"] is None
++    assert events["policy_failure_detected"] is False
++    assert events["exit_early"] is False
++
++
++def test_arrow_keys_can_replace_failure_and_success_keys():
++    listener, events = _make_tty_listener_for_key_test(failure_enters_intervention=True)
++    listener.episode_failure_key = "left"
++    listener.episode_success_key = "right"
++
++    listener._handle_key("LEFT")
++
++    assert events["policy_failure_detected"] is True
++    assert events["failure_recovery_active"] is True
++    assert events["enter_intervention"] is True
++    assert events["exit_early"] is False
++
++    listener._handle_key("RIGHT")
++
++    assert events["episode_outcome"] == "success"
++    assert events["exit_early"] is True
++
++
++def test_up_arrow_records_preventive_intervention_separately_from_failure():
++    listener, events = _make_tty_listener_for_key_test(failure_enters_intervention=True)
++    listener.episode_preventive_key = "up"
++    listener.episode_failure_key = "left"
++    listener.episode_success_key = "right"
++
++    listener._handle_key("UP")
++
++    assert events["preventive_intervention_detected"] is True
++    assert events["policy_failure_detected"] is False
++    assert events["intervention_kind"] == "preventive"
++    assert events["failure_recovery_active"] is True
++    assert events["enter_intervention"] is True
++    assert [item["event_type"] for item in events["hil_pending_events"]] == [
++        "preventive_notice"
++    ]
++
++    listener._handle_key("RIGHT")
++
++    assert events["episode_outcome"] == "success"
++    assert [item["event_type"] for item in events["hil_pending_events"]][-3:] == [
++        "human_takeover_end",
++        "preventive_complete",
++        "task_success",
++    ]
++
++
++def test_down_arrow_ends_failed_recovery_without_stopping_session():
++    listener, events = _make_tty_listener_for_key_test(failure_enters_intervention=True)
++    listener.episode_failure_key = "left"
++    listener.episode_success_key = "right"
++    listener.episode_terminal_failure_key = "down"
++
++    listener._handle_key("LEFT")
++    listener._handle_key("DOWN")
++
++    assert events["episode_outcome"] == "failure"
++    assert events["exit_early"] is True
++    assert events.get("stop_recording", False) is False
++    assert [item["event_type"] for item in events["hil_pending_events"]] == [
++        "failure_notice",
++        "human_takeover_end",
++        "terminal_failure",
++    ]
++
++
++def test_down_arrow_is_ignored_before_recovery():
++    listener, events = _make_tty_listener_for_key_test(failure_enters_intervention=True)
++    listener.episode_terminal_failure_key = "down"
++
++    listener._handle_key("DOWN")
++
++    assert events["episode_outcome"] is None
++    assert events["exit_early"] is False
++
++
++def test_arrow_outcome_keys_are_ignored_outside_recording_instead_of_using_legacy_actions():
++    listener, events = _make_tty_listener_for_key_test(failure_enters_intervention=True)
++    listener.episode_failure_key = "left"
++    listener.episode_success_key = "right"
++    events["phase"] = "reset"
++
++    listener._handle_key("LEFT")
++    listener._handle_key("RIGHT")
++
++    assert events["episode_outcome"] is None
++    assert events["policy_failure_detected"] is False
++    assert events["rerecord_episode"] is False
++    assert events["exit_early"] is False
+diff --git a/tests/value/test_lerobot_value_infer_utils.py b/tests/value/test_lerobot_value_infer_utils.py
+index f2c919e..c860295 100644
+--- a/tests/value/test_lerobot_value_infer_utils.py
++++ b/tests/value/test_lerobot_value_infer_utils.py
+@@ -54,3 +54,22 @@ def test_compute_task_thresholds_and_binarize_with_interventions():
+     )
+ 
+     assert indicators.tolist() == [0, 1, 1, 0, 1]
++
++
++def test_binarize_interventions_can_be_gated_by_episode_success():
++    task_indices = np.zeros(4, dtype=np.int64)
++    advantages = np.array([-0.4, -0.3, -0.2, -0.1], dtype=np.float32)
++    interventions = np.ones(4, dtype=np.float32)
++    episode_success = np.array([True, True, False, False], dtype=np.bool_)
++    thresholds = {0: -0.25}
++
++    indicators = _binarize_advantages(
++        task_indices=task_indices,
++        advantages=advantages,
++        thresholds=thresholds,
++        interventions=interventions,
++        force_intervention_positive=True,
++        intervention_episode_success=episode_success,
++    )
++
++    assert indicators.tolist() == [1, 1, 0, 0]

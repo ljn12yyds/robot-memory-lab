@@ -1,0 +1,91 @@
+diff --git a/src/lerobot/configs/train.py b/src/lerobot/configs/train.py
+index cee9dfdf..0edf8d37 100644
+--- a/src/lerobot/configs/train.py
++++ b/src/lerobot/configs/train.py
+@@ -71,7 +71,8 @@ class TrainPipelineConfig(HubMixin):
+     rabc_progress_path: str | None = None  # Path to precomputed SARM progress parquet file
+     rabc_kappa: float = 0.01  # Hard threshold for high-quality samples
+     rabc_epsilon: float = 1e-6  # Small constant for numerical stability
+-    rabc_head_mode: str | None = "sparse"  # For dual-head models: "sparse" or "dense"
++    rabc_head_mode: str | None = "sparse"  # "sparse", "dense", or direct "advantage"
++    rabc_beta: float = 1.0  # AWR temperature when rabc_head_mode="advantage"
+ 
+     # Rename map for the observation to override the image and state keys
+     rename_map: dict[str, str] = field(default_factory=dict)
+diff --git a/src/lerobot/scripts/lerobot_train.py b/src/lerobot/scripts/lerobot_train.py
+index 6cf73344..b3a7137c 100644
+--- a/src/lerobot/scripts/lerobot_train.py
++++ b/src/lerobot/scripts/lerobot_train.py
+@@ -293,6 +293,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
+             progress_path=cfg.rabc_progress_path,
+             chunk_size=chunk_size,
+             head_mode=head_mode,
++            beta=getattr(cfg, "rabc_beta", 1.0),
+             kappa=getattr(cfg, "rabc_kappa", 0.01),
+             epsilon=getattr(cfg, "rabc_epsilon", 1e-6),
+             device=device,
+diff --git a/src/lerobot/utils/rabc.py b/src/lerobot/utils/rabc.py
+index dc0c61c6..5484a292 100644
+--- a/src/lerobot/utils/rabc.py
++++ b/src/lerobot/utils/rabc.py
+@@ -58,6 +58,7 @@ class RABCWeights:
+         progress_path: str | Path,
+         chunk_size: int = 50,
+         head_mode: str = "sparse",
++        beta: float = 1.0,
+         kappa: float = 0.01,
+         epsilon: float = 1e-6,
+         fallback_weight: float = 1.0,
+@@ -66,13 +67,16 @@ class RABCWeights:
+         self.progress_path = resolve_hf_path(progress_path)
+         self.chunk_size = chunk_size
+         self.head_mode = head_mode
++        if beta <= 0:
++            raise ValueError("beta must be positive")
++        self.beta = beta
+         self.kappa = kappa
+         self.epsilon = epsilon
+         self.fallback_weight = fallback_weight
+         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+ 
+         # Determine progress column name
+-        self.progress_column = f"progress_{head_mode}"
++        self.progress_column = "advantage" if head_mode == "advantage" else f"progress_{head_mode}"
+ 
+         # Load progress values
+         logging.info(f"Loading SARM progress values from {self.progress_path}")
+@@ -111,8 +115,10 @@ class RABCWeights:
+         logging.info(f"Loaded {len(self.progress_lookup)} frame progress values")
+         logging.info(f"Chunk size for delta computation: {chunk_size}")
+ 
+-        # Compute global statistics for weight computation
+-        self._compute_global_stats()
++        # Segment-AWR supplies an advantage directly. The original RA-BC
++        # modes instead derive a weight from future progress deltas.
++        if self.head_mode != "advantage":
++            self._compute_global_stats()
+ 
+     def _compute_global_stats(self):
+         """Compute global mean and std of progress deltas for weight calculation."""
+@@ -176,6 +182,21 @@ class RABCWeights:
+         elif isinstance(indices, np.ndarray):
+             indices = indices.tolist()
+ 
++        if self.head_mode == "advantage":
++            advantages = np.array(
++                [self.progress_lookup.get(int(idx), np.nan) for idx in indices], dtype=np.float32
++            )
++            weights = np.exp(np.clip(advantages / self.beta, -20.0, 20.0))
++            weights[np.isnan(advantages)] = self.fallback_weight
++            batch_stats = {
++                "raw_mean_weight": float(np.mean(weights)),
++                "num_zero_weight": int(np.sum(weights == 0)),
++                "num_full_weight": int(np.sum(weights == 1.0)),
++            }
++            weights = torch.tensor(weights, device=self.device, dtype=torch.float32)
++            weights = weights * len(weights) / (weights.sum() + self.epsilon)
++            return weights, batch_stats
++
+         # Compute deltas and weights for each sample
+         deltas = []
+         for idx in indices:

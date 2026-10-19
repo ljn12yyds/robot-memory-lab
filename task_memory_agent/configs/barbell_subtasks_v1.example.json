@@ -1,0 +1,41 @@
+{
+  "schema": "pi05_subtask_annotations_v1",
+  "task": "Lift the blue barbell with the left arm and place it in the orange tray",
+  "subtasks": [
+    {
+      "id": "approach",
+      "instruction": "Move the left gripper to the center of the blue barbell",
+      "success_condition": "The gripper is aligned around the center of the blue barbell"
+    },
+    {
+      "id": "grasp",
+      "instruction": "Close the left gripper around the center of the blue barbell",
+      "success_condition": "The blue barbell is securely held"
+    },
+    {
+      "id": "transport",
+      "instruction": "Lift the blue barbell and move it above the orange tray",
+      "success_condition": "The held blue barbell is above the orange tray"
+    },
+    {
+      "id": "place",
+      "instruction": "Lower the blue barbell into the orange tray and release it",
+      "success_condition": "The blue barbell rests inside the orange tray"
+    },
+    {
+      "id": "retreat",
+      "instruction": "Move the left gripper away from the placed blue barbell",
+      "success_condition": "The gripper is clear and the barbell remains in the tray"
+    }
+  ],
+  "episodes": {
+    "0": [
+      {"subtask_id": "approach", "start_frame": 0, "end_frame": 300},
+      {"subtask_id": "grasp", "start_frame": 300, "end_frame": 360},
+      {"subtask_id": "transport", "start_frame": 360, "end_frame": 620},
+      {"subtask_id": "place", "start_frame": 620, "end_frame": 760},
+      {"subtask_id": "retreat", "start_frame": 760, "end_frame": 898}
+    ]
+  }
+}
+
